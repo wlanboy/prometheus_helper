@@ -6,9 +6,9 @@ charset-normalizer==3.4.9
     # via requests
 idna==3.18
     # via requests
-python-dotenv==1.2.2
+python-dotenv==1.2.1
     # via prometheus-helper (pyproject.toml)
-requests==2.34.2
+requests==2.32.5
     # via prometheus-helper (pyproject.toml)
-urllib3==2.7.0
+urllib3==2.6.3
     # via requests
