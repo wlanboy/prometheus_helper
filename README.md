@@ -1,6 +1,16 @@
 # Prometheus Helper
 
-Kommandozeilen-Tool, das den Status eines Prometheus-Servers abfragt und einen Überblick über dessen aktive Scrape-Targets liefert. Die Verbindung erfolgt per HTTP Basic Auth. Für jedes Target werden die Anzahl der gescrapten Metriken (`scrape_samples_scraped`) sowie die Anzahl der Target-Labels ermittelt. Targets, deren Metrik- und/oder Labelanzahl über dem Durchschnitt aller Targets liegt, werden in der Ausgabe als auffällig markiert – so lassen sich Targets identifizieren, die besonders viele Metriken oder besonders viele Labels liefern.
+Kommandozeilen-Tool, das den Status eines Prometheus-Servers abfragt und einen Überblick über dessen aktive Scrape-Targets liefert. Die Verbindung erfolgt per HTTP Basic Auth. Für jedes Target werden folgende Werte ermittelt:
+
+- Anzahl der gescrapten Metriken (`scrape_samples_scraped`)
+- Anzahl der Target-Labels
+- Scrape-Dauer (`scrape_duration_seconds`)
+- Anzahl neu hinzugekommener Serien pro Scrape (`scrape_series_added`)
+- letzter Scrape-Fehler (`lastError`)
+
+Targets, deren Metrik- und/oder Labelanzahl über dem Durchschnitt aller Targets liegt, werden in der Ausgabe als auffällig markiert – so lassen sich Targets identifizieren, die besonders viele Metriken oder besonders viele Labels liefern. Targets mit fehlgeschlagenem letzten Scrape werden gesondert aufgelistet.
+
+Zusätzlich wird eine globale TSDB-Übersicht (`/api/v1/status/tsdb`) ausgegeben: Serien-/Label-Paar-/Chunk-Anzahl sowie die Top-Metriken und -Labels nach Serienanzahl und Speicherverbrauch – nützlich, um Cardinality-Probleme unabhängig von einzelnen Targets zu erkennen.
 
 ## Bauen
 
