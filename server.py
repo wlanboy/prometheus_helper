@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
 
@@ -13,6 +14,24 @@ from main import (
     collect_target_status,
     load_config,
 )
+
+_DURATION_RE = re.compile(r"(\d+)(ms|s|m|h|d|w|y)")
+_DURATION_UNIT_SECONDS = {
+    "ms": 0.001,
+    "s": 1,
+    "m": 60,
+    "h": 3600,
+    "d": 86400,
+    "w": 604800,
+    "y": 31536000,
+}
+
+
+def parse_duration_to_seconds(value: str) -> float | None:
+    matches = _DURATION_RE.findall(value or "")
+    if not matches:
+        return None
+    return sum(int(amount) * _DURATION_UNIT_SECONDS[unit] for amount, unit in matches)
 
 
 class PrometheusHelperCollector:
@@ -28,7 +47,17 @@ class PrometheusHelperCollector:
         )
         target_labels = GaugeMetricFamily(
             "prometheus_helper_target_label_count",
-            "Anzahl Labels eines Scrape-Targets",
+            "Anzahl Labels eines Scrape-Targets nach dem Relabeling",
+            labels=["job", "instance"],
+        )
+        target_discovered_labels = GaugeMetricFamily(
+            "prometheus_helper_target_discovered_label_count",
+            "Anzahl Labels eines Scrape-Targets vor dem Relabeling (discoveredLabels)",
+            labels=["job", "instance"],
+        )
+        target_relabel_dropped_labels = GaugeMetricFamily(
+            "prometheus_helper_target_relabel_dropped_labels",
+            "Anzahl der durch Relabeling entfernten Labels (discoveredLabels - labels)",
             labels=["job", "instance"],
         )
         target_metrics = GaugeMetricFamily(
@@ -61,6 +90,10 @@ class PrometheusHelperCollector:
         for s in statuses:
             target_up.add_metric([s.job, s.instance], 1.0 if s.health == "up" else 0.0)
             target_labels.add_metric([s.job, s.instance], s.label_count)
+            target_discovered_labels.add_metric([s.job, s.instance], s.discovered_label_count)
+            target_relabel_dropped_labels.add_metric(
+                [s.job, s.instance], s.discovered_label_count - s.label_count
+            )
             if s.metric_count is not None:
                 target_metrics.add_metric([s.job, s.instance], s.metric_count)
             if s.scrape_duration is not None:
@@ -73,6 +106,8 @@ class PrometheusHelperCollector:
 
         yield target_up
         yield target_labels
+        yield target_discovered_labels
+        yield target_relabel_dropped_labels
         yield target_metrics
         yield target_duration
         yield target_series_added
@@ -129,6 +164,45 @@ class PrometheusHelperCollector:
             "Top-Labels nach Speicherverbrauch in Bytes",
             "memoryInBytesByLabelName",
         )
+
+        try:
+            runtime_info = self.client.runtime_info()
+        except PrometheusError as exc:
+            print(f"Fehler beim Abfragen der Runtime-Info: {exc}", file=sys.stderr)
+            runtime_info = {}
+
+        reload_success = GaugeMetricFamily(
+            "prometheus_helper_runtime_reload_config_success",
+            "1 wenn der letzte Config-Reload erfolgreich war, sonst 0",
+        )
+        if "reloadConfigSuccess" in runtime_info:
+            reload_success.add_metric([], 1.0 if runtime_info["reloadConfigSuccess"] else 0.0)
+        yield reload_success
+
+        goroutines = GaugeMetricFamily(
+            "prometheus_helper_runtime_goroutines",
+            "Anzahl laufender Goroutinen im Prometheus-Prozess",
+        )
+        if "goroutineCount" in runtime_info:
+            goroutines.add_metric([], runtime_info["goroutineCount"])
+        yield goroutines
+
+        corruptions = GaugeMetricFamily(
+            "prometheus_helper_runtime_corruptions_total",
+            "Anzahl erkannter WAL-/Storage-Korruptionen (corruptionCount)",
+        )
+        if "corruptionCount" in runtime_info:
+            corruptions.add_metric([], runtime_info["corruptionCount"])
+        yield corruptions
+
+        retention_seconds = GaugeMetricFamily(
+            "prometheus_helper_runtime_storage_retention_seconds",
+            "Konfigurierte Storage-Retention in Sekunden",
+        )
+        retention_value = parse_duration_to_seconds(runtime_info.get("storageRetention", ""))
+        if retention_value is not None:
+            retention_seconds.add_metric([], retention_value)
+        yield retention_seconds
 
 
 def main() -> None:

@@ -17,6 +17,7 @@ class TargetStatus:
     instance: str
     health: str
     label_count: int
+    discovered_label_count: int
     metric_count: int | None
     scrape_duration: float | None
     series_added: int | None
@@ -73,6 +74,9 @@ class PrometheusClient:
     def tsdb_status(self) -> dict:
         return self._get("/api/v1/status/tsdb")
 
+    def runtime_info(self) -> dict:
+        return self._get("/api/v1/status/runtimeinfo")
+
 
 def query_metric_by_target(client: PrometheusClient, metric_name: str) -> dict[tuple[str, str], float]:
     values: dict[tuple[str, str], float] = {}
@@ -103,6 +107,7 @@ def collect_target_status(client: PrometheusClient) -> list[TargetStatus]:
     statuses = []
     for target in targets:
         labels = target.get("labels", {})
+        discovered_labels = target.get("discoveredLabels", {})
         job = labels.get("job", "unknown")
         instance = labels.get("instance", "unknown")
         health = target.get("health", "unknown")
@@ -119,6 +124,7 @@ def collect_target_status(client: PrometheusClient) -> list[TargetStatus]:
                 instance=instance,
                 health=health,
                 label_count=len(labels),
+                discovered_label_count=len(discovered_labels),
                 metric_count=int(metric_value) if metric_value is not None else None,
                 scrape_duration=duration_value,
                 series_added=int(series_value) if series_value is not None else None,
@@ -162,13 +168,25 @@ def print_report(statuses: list[TargetStatus]) -> None:
                 s.health,
                 str(s.metric_count) if s.metric_count is not None else "n/a",
                 str(s.label_count),
+                str(s.discovered_label_count),
+                str(s.discovered_label_count - s.label_count),
                 f"{s.scrape_duration:.3f}" if s.scrape_duration is not None else "n/a",
                 str(s.series_added) if s.series_added is not None else "n/a",
                 ", ".join(flags),
             )
         )
 
-    headers = ("TARGET", "HEALTH", "METRIKEN", "LABELS", "DAUER(s)", "NEUE_SERIEN", "AUFFAELLIG")
+    headers = (
+        "TARGET",
+        "HEALTH",
+        "METRIKEN",
+        "LABELS",
+        "LABELS_ROH",
+        "RELABEL_ENTF",
+        "DAUER(s)",
+        "NEUE_SERIEN",
+        "AUFFAELLIG",
+    )
     widths = [
         max(len(headers[i]), *(len(r[i]) for r in rows)) for i in range(len(headers))
     ]
@@ -225,6 +243,24 @@ def print_tsdb_report(client: PrometheusClient, top_n: int = 5) -> None:
     print_top(f"Top {top_n} Labels nach Speicherverbrauch", "memoryInBytesByLabelName")
 
 
+def print_runtime_report(client: PrometheusClient) -> None:
+    try:
+        data = client.runtime_info()
+    except PrometheusError as exc:
+        print()
+        print(f"Runtime-Info nicht verfuegbar: {exc}")
+        return
+
+    print()
+    print("Runtime-Info:")
+    print(f"  Startzeit: {data.get('startTime', 'n/a')}")
+    print(f"  Config-Reload erfolgreich: {data.get('reloadConfigSuccess', 'n/a')}")
+    print(f"  Letzte Config-Aenderung: {data.get('lastConfigTime', 'n/a')}")
+    print(f"  Storage-Retention: {data.get('storageRetention', 'n/a')}")
+    print(f"  WAL-/Storage-Korruptionen: {data.get('corruptionCount', 'n/a')}")
+    print(f"  Goroutinen: {data.get('goroutineCount', 'n/a')}")
+
+
 def str_to_bool(value: str) -> bool:
     return value.strip().lower() not in ("false", "0", "no", "off")
 
@@ -260,6 +296,7 @@ def main() -> None:
         statuses = collect_target_status(client)
         print_report(statuses)
         print_tsdb_report(client)
+        print_runtime_report(client)
     except PrometheusError as exc:
         print(f"Fehler: {exc}", file=sys.stderr)
         sys.exit(1)
