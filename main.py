@@ -5,10 +5,16 @@ import os
 import statistics
 import sys
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import requests
 import urllib3
 from dotenv import load_dotenv
+
+
+class TargetKey(NamedTuple):
+    job: str
+    instance: str
 
 
 @dataclass
@@ -22,6 +28,17 @@ class TargetStatus:
     scrape_duration: float | None
     series_added: int | None
     last_error: str
+
+    def conspicuous_flags(self, avg_metrics: float | None, avg_labels: float) -> list[str]:
+        above_metrics = avg_metrics is not None and self.metric_count is not None and self.metric_count > avg_metrics
+        above_labels = self.label_count > avg_labels
+        if above_metrics and above_labels:
+            return ["METRIKEN+LABELS"]
+        if above_metrics:
+            return ["METRIKEN"]
+        if above_labels:
+            return ["LABELS"]
+        return []
 
 
 @dataclass
@@ -112,8 +129,8 @@ class PrometheusClient:
         return self._get("/api/v1/status/runtimeinfo")
 
 
-def query_metric_by_target(client: PrometheusClient, metric_name: str) -> dict[tuple[str, str], float]:
-    values: dict[tuple[str, str], float] = {}
+def query_metric_by_target(client: PrometheusClient, metric_name: str) -> dict[TargetKey, float]:
+    values: dict[TargetKey, float] = {}
     try:
         result = client.instant_query(metric_name)
     except PrometheusError:
@@ -126,7 +143,7 @@ def query_metric_by_target(client: PrometheusClient, metric_name: str) -> dict[t
         if job is None or instance is None:
             continue
         try:
-            values[(job, instance)] = float(entry["value"][1])
+            values[TargetKey(job, instance)] = float(entry["value"][1])
         except (KeyError, IndexError, ValueError):
             continue
     return values
@@ -146,7 +163,7 @@ def collect_target_status(client: PrometheusClient) -> list[TargetStatus]:
         instance = labels.get("instance", "unknown")
         health = target.get("health", "unknown")
         last_error = target.get("lastError", "")
-        key = (job, instance)
+        key = TargetKey(job, instance)
 
         metric_value = samples_scraped.get(key)
         duration_value = scrape_duration.get(key)
@@ -219,15 +236,7 @@ def print_report(statuses: list[TargetStatus]) -> None:
 
     rows = []
     for s in sorted(statuses, key=lambda s: (s.metric_count or -1), reverse=True):
-        above_metrics = avg_metrics is not None and s.metric_count is not None and s.metric_count > avg_metrics
-        above_labels = s.label_count > avg_labels
-        flags = []
-        if above_metrics and above_labels:
-            flags.append("METRIKEN+LABELS")
-        elif above_metrics:
-            flags.append("METRIKEN")
-        elif above_labels:
-            flags.append("LABELS")
+        flags = s.conspicuous_flags(avg_metrics, avg_labels)
         rows.append(
             (
                 f"{s.job}/{s.instance}",
