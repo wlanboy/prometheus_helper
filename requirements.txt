@@ -2,15 +2,15 @@
 #    uv pip compile pyproject.toml -o requirements.txt
 certifi==2026.7.22
     # via requests
-charset-normalizer==3.5.0
+charset-normalizer==3.5.1
     # via requests
-idna==3.18
+idna==3.19
     # via requests
 prometheus-client==0.26.0
     # via prometheus-helper (pyproject.toml)
-python-dotenv==1.2.1
+python-dotenv==1.2.3
     # via prometheus-helper (pyproject.toml)
-requests==2.32.5
+requests==2.34.2
     # via prometheus-helper (pyproject.toml)
-urllib3==2.6.3
+urllib3==2.7.0
     # via requests
