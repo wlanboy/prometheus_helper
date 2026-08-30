@@ -11,8 +11,13 @@ from prometheus_client.core import REGISTRY, GaugeMetricFamily
 from main import (
     PrometheusClient,
     PrometheusError,
+    RuntimeStatus,
+    TsdbStatus,
+    add_common_args,
+    collect_runtime_status,
     collect_target_status,
-    load_config,
+    collect_tsdb_status,
+    create_client_or_exit,
 )
 
 _DURATION_RE = re.compile(r"(\d+)(ms|s|m|h|d|w|y)")
@@ -114,12 +119,11 @@ class PrometheusHelperCollector:
         yield target_last_error
 
         try:
-            tsdb = self.client.tsdb_status()
+            tsdb = collect_tsdb_status(self.client, top_n=self.top_n)
         except PrometheusError as exc:
             print(f"Fehler beim Abfragen des TSDB-Status: {exc}", file=sys.stderr)
-            tsdb = {}
+            tsdb = TsdbStatus(None, None, None, [], [], [])
 
-        head_stats = tsdb.get("headStats", {})
         head_series = GaugeMetricFamily(
             "prometheus_helper_tsdb_head_series", "Anzahl Serien im TSDB-Head"
         )
@@ -129,77 +133,77 @@ class PrometheusHelperCollector:
         head_chunks = GaugeMetricFamily(
             "prometheus_helper_tsdb_head_chunks", "Anzahl Chunks im TSDB-Head"
         )
-        if "numSeries" in head_stats:
-            head_series.add_metric([], head_stats["numSeries"])
-        if "numLabelPairs" in head_stats:
-            head_label_pairs.add_metric([], head_stats["numLabelPairs"])
-        if "chunkCount" in head_stats:
-            head_chunks.add_metric([], head_stats["chunkCount"])
+        if tsdb.num_series is not None:
+            head_series.add_metric([], tsdb.num_series)
+        if tsdb.num_label_pairs is not None:
+            head_label_pairs.add_metric([], tsdb.num_label_pairs)
+        if tsdb.chunk_count is not None:
+            head_chunks.add_metric([], tsdb.chunk_count)
         yield head_series
         yield head_label_pairs
         yield head_chunks
 
-        def top_metric_family(name: str, help_text: str, key: str) -> GaugeMetricFamily:
+        def top_metric_family(name: str, help_text: str, entries) -> GaugeMetricFamily:
             family = GaugeMetricFamily(name, help_text, labels=["name"])
-            for entry in tsdb.get(key, [])[: self.top_n]:
+            for entry in entries:
                 try:
-                    value = float(entry.get("value"))
+                    value = float(entry.value)
                 except (TypeError, ValueError):
                     continue
-                family.add_metric([str(entry.get("name", "?"))], value)
+                family.add_metric([entry.name], value)
             return family
 
         yield top_metric_family(
             "prometheus_helper_tsdb_series_count_by_metric_name",
             "Top-Metriken nach Serienanzahl",
-            "seriesCountByMetricName",
+            tsdb.top_series_by_metric,
         )
         yield top_metric_family(
             "prometheus_helper_tsdb_label_value_count_by_label_name",
             "Top-Labels nach Anzahl unterschiedlicher Werte (Cardinality)",
-            "labelValueCountByLabelName",
+            tsdb.top_label_value_count,
         )
         yield top_metric_family(
             "prometheus_helper_tsdb_memory_bytes_by_label_name",
             "Top-Labels nach Speicherverbrauch in Bytes",
-            "memoryInBytesByLabelName",
+            tsdb.top_memory_by_label,
         )
 
         try:
-            runtime_info = self.client.runtime_info()
+            runtime = collect_runtime_status(self.client)
         except PrometheusError as exc:
             print(f"Fehler beim Abfragen der Runtime-Info: {exc}", file=sys.stderr)
-            runtime_info = {}
+            runtime = RuntimeStatus(None, None, None, None, None, None)
 
         reload_success = GaugeMetricFamily(
             "prometheus_helper_runtime_reload_config_success",
             "1 wenn der letzte Config-Reload erfolgreich war, sonst 0",
         )
-        if "reloadConfigSuccess" in runtime_info:
-            reload_success.add_metric([], 1.0 if runtime_info["reloadConfigSuccess"] else 0.0)
+        if runtime.reload_config_success is not None:
+            reload_success.add_metric([], 1.0 if runtime.reload_config_success else 0.0)
         yield reload_success
 
         goroutines = GaugeMetricFamily(
             "prometheus_helper_runtime_goroutines",
             "Anzahl laufender Goroutinen im Prometheus-Prozess",
         )
-        if "goroutineCount" in runtime_info:
-            goroutines.add_metric([], runtime_info["goroutineCount"])
+        if runtime.goroutine_count is not None:
+            goroutines.add_metric([], runtime.goroutine_count)
         yield goroutines
 
         corruptions = GaugeMetricFamily(
             "prometheus_helper_runtime_corruptions_total",
             "Anzahl erkannter WAL-/Storage-Korruptionen (corruptionCount)",
         )
-        if "corruptionCount" in runtime_info:
-            corruptions.add_metric([], runtime_info["corruptionCount"])
+        if runtime.corruption_count is not None:
+            corruptions.add_metric([], runtime.corruption_count)
         yield corruptions
 
         retention_seconds = GaugeMetricFamily(
             "prometheus_helper_runtime_storage_retention_seconds",
             "Konfigurierte Storage-Retention in Sekunden",
         )
-        retention_value = parse_duration_to_seconds(runtime_info.get("storageRetention", ""))
+        retention_value = parse_duration_to_seconds(runtime.storage_retention or "")
         if retention_value is not None:
             retention_seconds.add_metric([], retention_value)
         yield retention_seconds
@@ -209,26 +213,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Stellt den Status eines Prometheus-Servers und dessen Scrape-Targets als Prometheus-Metriken bereit."
     )
-    parser.add_argument("--env-file", help="Pfad zu einer .env-Datei (Standard: .env im aktuellen Verzeichnis)")
-    parser.add_argument(
-        "--insecure",
-        action="store_true",
-        help="SSL-Zertifikatspruefung deaktivieren (z.B. bei selbstsignierten Zertifikaten)",
-    )
+    add_common_args(parser)
     parser.add_argument("--port", type=int, default=9877, help="Port fuer den Metrik-Endpunkt (Standard: 9877)")
     parser.add_argument(
         "--top-n", type=int, default=5, help="Anzahl der Top-Eintraege je TSDB-Rangliste (Standard: 5)"
     )
     args = parser.parse_args()
 
-    try:
-        url, user, password, verify_ssl = load_config(args.env_file)
-        if args.insecure:
-            verify_ssl = False
-        client = PrometheusClient(url, user, password, verify_ssl=verify_ssl)
-    except PrometheusError as exc:
-        print(f"Fehler: {exc}", file=sys.stderr)
-        sys.exit(1)
+    client = create_client_or_exit(args)
 
     REGISTRY.register(PrometheusHelperCollector(client, top_n=args.top_n))
     start_http_server(args.port)

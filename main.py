@@ -24,6 +24,40 @@ class TargetStatus:
     last_error: str
 
 
+@dataclass
+class PrometheusConfig:
+    url: str
+    user: str | None
+    password: str | None
+    verify_ssl: bool
+
+
+@dataclass
+class TsdbTopEntry:
+    name: str
+    value: float | int | None
+
+
+@dataclass
+class TsdbStatus:
+    num_series: int | None
+    num_label_pairs: int | None
+    chunk_count: int | None
+    top_series_by_metric: list[TsdbTopEntry]
+    top_label_value_count: list[TsdbTopEntry]
+    top_memory_by_label: list[TsdbTopEntry]
+
+
+@dataclass
+class RuntimeStatus:
+    start_time: str | None
+    reload_config_success: bool | None
+    last_config_time: str | None
+    storage_retention: str | None
+    corruption_count: int | None
+    goroutine_count: int | None
+
+
 class PrometheusError(Exception):
     pass
 
@@ -134,6 +168,38 @@ def collect_target_status(client: PrometheusClient) -> list[TargetStatus]:
     return statuses
 
 
+def collect_tsdb_status(client: PrometheusClient, top_n: int = 5) -> TsdbStatus:
+    data = client.tsdb_status()
+    head_stats = data.get("headStats", {})
+
+    def top_entries(key: str) -> list[TsdbTopEntry]:
+        return [
+            TsdbTopEntry(name=str(entry.get("name", "?")), value=entry.get("value"))
+            for entry in data.get(key, [])[:top_n]
+        ]
+
+    return TsdbStatus(
+        num_series=head_stats.get("numSeries"),
+        num_label_pairs=head_stats.get("numLabelPairs"),
+        chunk_count=head_stats.get("chunkCount"),
+        top_series_by_metric=top_entries("seriesCountByMetricName"),
+        top_label_value_count=top_entries("labelValueCountByLabelName"),
+        top_memory_by_label=top_entries("memoryInBytesByLabelName"),
+    )
+
+
+def collect_runtime_status(client: PrometheusClient) -> RuntimeStatus:
+    data = client.runtime_info()
+    return RuntimeStatus(
+        start_time=data.get("startTime"),
+        reload_config_success=data.get("reloadConfigSuccess"),
+        last_config_time=data.get("lastConfigTime"),
+        storage_retention=data.get("storageRetention"),
+        corruption_count=data.get("corruptionCount"),
+        goroutine_count=data.get("goroutineCount"),
+    )
+
+
 def print_report(statuses: list[TargetStatus]) -> None:
     if not statuses:
         print("Keine aktiven Targets gefunden.")
@@ -213,59 +279,60 @@ def print_report(statuses: list[TargetStatus]) -> None:
 
 def print_tsdb_report(client: PrometheusClient, top_n: int = 5) -> None:
     try:
-        data = client.tsdb_status()
+        tsdb = collect_tsdb_status(client, top_n=top_n)
     except PrometheusError as exc:
         print()
         print(f"TSDB-Status nicht verfuegbar: {exc}")
         return
 
-    head_stats = data.get("headStats", {})
     print()
     print("TSDB-Uebersicht (global):")
-    if head_stats:
-        print(
-            f"  Serien: {head_stats.get('numSeries', 'n/a')}  "
-            f"Label-Paare: {head_stats.get('numLabelPairs', 'n/a')}  "
-            f"Chunks: {head_stats.get('chunkCount', 'n/a')}"
-        )
+    if tsdb.num_series is not None or tsdb.num_label_pairs is not None or tsdb.chunk_count is not None:
+        num_series = tsdb.num_series if tsdb.num_series is not None else "n/a"
+        num_label_pairs = tsdb.num_label_pairs if tsdb.num_label_pairs is not None else "n/a"
+        chunk_count = tsdb.chunk_count if tsdb.chunk_count is not None else "n/a"
+        print(f"  Serien: {num_series}  Label-Paare: {num_label_pairs}  Chunks: {chunk_count}")
 
-    def print_top(title: str, key: str) -> None:
-        entries = data.get(key, [])[:top_n]
+    def print_top(title: str, entries: list[TsdbTopEntry]) -> None:
         print(f"  {title}:")
         if not entries:
             print("    (keine Daten)")
             return
         for entry in entries:
-            print(f"    {entry.get('name', '?')}: {entry.get('value', '?')}")
+            value = entry.value if entry.value is not None else "?"
+            print(f"    {entry.name}: {value}")
 
-    print_top(f"Top {top_n} Metriken nach Serienanzahl", "seriesCountByMetricName")
-    print_top(f"Top {top_n} Labels nach Anzahl unterschiedlicher Werte (Cardinality)", "labelValueCountByLabelName")
-    print_top(f"Top {top_n} Labels nach Speicherverbrauch", "memoryInBytesByLabelName")
+    print_top(f"Top {top_n} Metriken nach Serienanzahl", tsdb.top_series_by_metric)
+    print_top(f"Top {top_n} Labels nach Anzahl unterschiedlicher Werte (Cardinality)", tsdb.top_label_value_count)
+    print_top(f"Top {top_n} Labels nach Speicherverbrauch", tsdb.top_memory_by_label)
 
 
 def print_runtime_report(client: PrometheusClient) -> None:
     try:
-        data = client.runtime_info()
+        runtime = collect_runtime_status(client)
     except PrometheusError as exc:
         print()
         print(f"Runtime-Info nicht verfuegbar: {exc}")
         return
 
+    def or_na(value):
+        return value if value is not None else "n/a"
+
     print()
     print("Runtime-Info:")
-    print(f"  Startzeit: {data.get('startTime', 'n/a')}")
-    print(f"  Config-Reload erfolgreich: {data.get('reloadConfigSuccess', 'n/a')}")
-    print(f"  Letzte Config-Aenderung: {data.get('lastConfigTime', 'n/a')}")
-    print(f"  Storage-Retention: {data.get('storageRetention', 'n/a')}")
-    print(f"  WAL-/Storage-Korruptionen: {data.get('corruptionCount', 'n/a')}")
-    print(f"  Goroutinen: {data.get('goroutineCount', 'n/a')}")
+    print(f"  Startzeit: {or_na(runtime.start_time)}")
+    print(f"  Config-Reload erfolgreich: {or_na(runtime.reload_config_success)}")
+    print(f"  Letzte Config-Aenderung: {or_na(runtime.last_config_time)}")
+    print(f"  Storage-Retention: {or_na(runtime.storage_retention)}")
+    print(f"  WAL-/Storage-Korruptionen: {or_na(runtime.corruption_count)}")
+    print(f"  Goroutinen: {or_na(runtime.goroutine_count)}")
 
 
 def str_to_bool(value: str) -> bool:
     return value.strip().lower() not in ("false", "0", "no", "off")
 
 
-def load_config(env_file: str | None) -> tuple[str, str | None, str | None, bool]:
+def load_config(env_file: str | None) -> PrometheusConfig:
     load_dotenv(dotenv_path=env_file) if env_file else load_dotenv()
 
     url = os.getenv("PROMETHEUS_URL")
@@ -275,31 +342,50 @@ def load_config(env_file: str | None) -> tuple[str, str | None, str | None, bool
     user = os.getenv("PROMETHEUS_USER")
     password = os.getenv("PROMETHEUS_PASSWORD")
     verify_ssl = str_to_bool(os.getenv("PROMETHEUS_VERIFY_SSL", "true"))
-    return url, user, password, verify_ssl
+    return PrometheusConfig(url=url, user=user, password=password, verify_ssl=verify_ssl)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Zeigt den Status eines Prometheus-Servers und dessen Scrape-Targets an.")
+def build_client(config: PrometheusConfig, insecure: bool = False) -> PrometheusClient:
+    verify_ssl = False if insecure else config.verify_ssl
+    return PrometheusClient(config.url, config.user, config.password, verify_ssl=verify_ssl)
+
+
+def exit_with_error(exc: PrometheusError) -> None:
+    print(f"Fehler: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+
+def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--env-file", help="Pfad zu einer .env-Datei (Standard: .env im aktuellen Verzeichnis)")
     parser.add_argument(
         "--insecure",
         action="store_true",
         help="SSL-Zertifikatspruefung deaktivieren (z.B. bei selbstsignierten Zertifikaten)",
     )
+
+
+def create_client_or_exit(args: argparse.Namespace) -> PrometheusClient:
+    try:
+        config = load_config(args.env_file)
+        return build_client(config, insecure=args.insecure)
+    except PrometheusError as exc:
+        exit_with_error(exc)
+        raise AssertionError("unreachable")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Zeigt den Status eines Prometheus-Servers und dessen Scrape-Targets an.")
+    add_common_args(parser)
     args = parser.parse_args()
 
+    client = create_client_or_exit(args)
     try:
-        url, user, password, verify_ssl = load_config(args.env_file)
-        if args.insecure:
-            verify_ssl = False
-        client = PrometheusClient(url, user, password, verify_ssl=verify_ssl)
         statuses = collect_target_status(client)
         print_report(statuses)
         print_tsdb_report(client)
         print_runtime_report(client)
     except PrometheusError as exc:
-        print(f"Fehler: {exc}", file=sys.stderr)
-        sys.exit(1)
+        exit_with_error(exc)
 
 
 if __name__ == "__main__":
