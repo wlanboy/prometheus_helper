@@ -1,7 +1,7 @@
 [project]
 name = "prometheus-helper"
 version = "0.1.0"
-description = "Add your description here"
+description = "Prometheus health checker"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
@@ -16,3 +16,7 @@ dev = [
     "pytest>=8.4.2",
     "ruff>=0.16.5",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
