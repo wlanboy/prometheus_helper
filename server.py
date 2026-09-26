@@ -19,6 +19,7 @@ from main import (
     collect_target_status,
     collect_tsdb_status,
     create_client_or_exit,
+    parse_timestamp,
 )
 
 T = TypeVar("T")
@@ -111,6 +112,11 @@ class PrometheusHelperCollector:
             "Anzahl gescrapter Samples eines Targets (scrape_samples_scraped)",
             labels=["job", "instance"],
         )
+        target_metrics_post_relabel = GaugeMetricFamily(
+            "prometheus_helper_target_metric_count_post_relabeling",
+            "Anzahl gespeicherter Samples eines Targets nach metric_relabel_configs (scrape_samples_post_metric_relabeling)",
+            labels=["job", "instance"],
+        )
         target_duration = GaugeMetricFamily(
             "prometheus_helper_target_scrape_duration_seconds",
             "Dauer des letzten Scrapes eines Targets in Sekunden",
@@ -147,6 +153,8 @@ class PrometheusHelperCollector:
                 target_relabel_dropped_labels.add_metric([s.job, s.instance], s.relabel_dropped_labels)
             if s.metric_count is not None:
                 target_metrics.add_metric([s.job, s.instance], s.metric_count)
+            if s.metric_count_post_relabel is not None:
+                target_metrics_post_relabel.add_metric([s.job, s.instance], s.metric_count_post_relabel)
             if s.scrape_duration is not None:
                 target_duration.add_metric([s.job, s.instance], s.scrape_duration)
             if s.series_added is not None:
@@ -161,6 +169,7 @@ class PrometheusHelperCollector:
         yield target_discovered_labels
         yield target_relabel_dropped_labels
         yield target_metrics
+        yield target_metrics_post_relabel
         yield target_duration
         yield target_series_added
         yield target_last_error
@@ -225,6 +234,15 @@ class PrometheusHelperCollector:
             scrape_success,
             scrape_duration,
         )
+
+        start_time = GaugeMetricFamily(
+            "prometheus_helper_runtime_start_time_seconds",
+            "Startzeitpunkt des Prometheus-Prozesses als Unix-Timestamp (Uptime: time() - Wert)",
+        )
+        start_time_value = parse_timestamp(runtime.start_time)
+        if start_time_value is not None:
+            start_time.add_metric([], start_time_value.timestamp())
+        yield start_time
 
         reload_success = GaugeMetricFamily(
             "prometheus_helper_runtime_reload_config_success",

@@ -2,7 +2,7 @@
 
 Kommandozeilen-Tool, das den Status eines Prometheus-Servers abfragt und einen Überblick über dessen aktive Scrape-Targets liefert. Die Verbindung erfolgt per HTTP Basic Auth. Für jedes Target werden folgende Werte ermittelt:
 
-- Anzahl der gescrapten Metriken (`scrape_samples_scraped`)
+- Anzahl der gescrapten Metriken (`scrape_samples_scraped`) sowie der davon tatsächlich gespeicherten nach `metric_relabel_configs` (`scrape_samples_post_metric_relabeling`)
 - Anzahl der Target-Labels nach dem Relabeling sowie roh vor dem Relabeling (`discoveredLabels`) – die Differenz zeigt, wie viele Labels durch Relabeling entfernt werden
 - Scrape-Dauer (`scrape_duration_seconds`)
 - Anzahl neu hinzugekommener Serien pro Scrape (`scrape_series_added`)
@@ -10,7 +10,7 @@ Kommandozeilen-Tool, das den Status eines Prometheus-Servers abfragt und einen �
 
 Neben den aktiven Targets aus `/api/v1/targets` werden auch Targets berücksichtigt, deren Scrape-Ergebnisse nur per Remote-Write ankommen (z. B. von Grafana Alloy). Sie werden über die Serien `up`/`scrape_samples_scraped` erkannt und mit der Quelle `remote_write` gekennzeichnet. Labelanzahl und Fehlertext sind für sie nicht verfügbar; die Health wird aus `up` abgeleitet.
 
-Targets, deren Metrik- und/oder Labelanzahl über dem Durchschnitt aller Targets liegt, werden in der Ausgabe als auffällig markiert – so lassen sich Targets identifizieren, die besonders viele Metriken oder besonders viele Labels liefern. Targets mit fehlgeschlagenem letzten Scrape werden gesondert aufgelistet.
+Targets, deren Metrik- und/oder Labelanzahl über dem Doppelten des Medians aller Targets liegt (Faktor per `--factor` einstellbar), werden in der Ausgabe als auffällig markiert. Der Median wird im Gegensatz zum Mittelwert nicht von einzelnen Ausreißern verzerrt – so lassen sich Targets identifizieren, die besonders viele Metriken oder besonders viele Labels liefern. Targets mit fehlgeschlagenem letzten Scrape werden gesondert aufgelistet.
 
 Zusätzlich wird eine globale TSDB-Übersicht (`/api/v1/status/tsdb`) ausgegeben: Serien-/Label-Paar-/Chunk-Anzahl sowie die Top-Metriken und -Labels nach Serienanzahl und Speicherverbrauch – nützlich, um Cardinality-Probleme unabhängig von einzelnen Targets zu erkennen.
 
@@ -57,6 +57,7 @@ Optionale Parameter:
 ```bash
 uv run main.py --env-file /pfad/zu/anderer.env   # abweichende .env-Datei verwenden
 uv run main.py --insecure                        # SSL-Zertifikatsprüfung für diesen Lauf deaktivieren
+uv run main.py --factor 3                        # auffällig erst ab dem 3-fachen Median (Standard: 2)
 uv run main.py --ca-file /pfad/zu/ca.pem         # CA-Bundle für die Zertifikatsprüfung
 ```
 
@@ -87,6 +88,7 @@ Bereitgestellte Metriken:
 | `prometheus_helper_target_discovered_label_count{job,instance}` | Anzahl der Target-Labels vor dem Relabeling (`discoveredLabels`) |
 | `prometheus_helper_target_relabel_dropped_labels{job,instance}` | Durch Relabeling entfernte Labels (`discoveredLabels` - `labels`) |
 | `prometheus_helper_target_metric_count{job,instance}` | Anzahl gescrapter Metriken (`scrape_samples_scraped`) |
+| `prometheus_helper_target_metric_count_post_relabeling{job,instance}` | Anzahl gespeicherter Metriken nach `metric_relabel_configs` (`scrape_samples_post_metric_relabeling`) |
 | `prometheus_helper_target_scrape_duration_seconds{job,instance}` | Scrape-Dauer (`scrape_duration_seconds`) |
 | `prometheus_helper_target_series_added{job,instance}` | Neue Serien pro Scrape (`scrape_series_added`) |
 | `prometheus_helper_target_last_scrape_error{job,instance}` | 1 wenn letzter Scrape fehlgeschlagen ist (bei Remote-Write-Targets: `up == 0`). Den Fehlertext zeigt `main.py`; als Label würde er pro Fehlermeldung eine neue Serie erzeugen |
@@ -96,6 +98,7 @@ Bereitgestellte Metriken:
 | `prometheus_helper_tsdb_series_count_by_metric_name{name}` | Top-Metriken nach Serienanzahl |
 | `prometheus_helper_tsdb_label_value_count_by_label_name{name}` | Top-Labels nach Cardinality |
 | `prometheus_helper_tsdb_memory_bytes_by_label_name{name}` | Top-Labels nach Speicherverbrauch |
+| `prometheus_helper_runtime_start_time_seconds` | Startzeitpunkt des Prometheus-Prozesses als Unix-Timestamp (Uptime: `time() - prometheus_helper_runtime_start_time_seconds`) |
 | `prometheus_helper_runtime_reload_config_success` | 1 wenn der letzte Config-Reload erfolgreich war, sonst 0 |
 | `prometheus_helper_runtime_goroutines` | Anzahl laufender Goroutinen im Prometheus-Prozess |
 | `prometheus_helper_runtime_corruptions_total` | Anzahl erkannter WAL-/Storage-Korruptionen (`corruptionCount`) |

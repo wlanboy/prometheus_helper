@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import statistics
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import NamedTuple
 
 import requests
@@ -30,6 +32,7 @@ class TargetStatus:
     label_count: int | None
     discovered_label_count: int | None
     metric_count: int | None
+    metric_count_post_relabel: int | None
     scrape_duration: float | None
     series_added: int | None
     last_error: str
@@ -40,9 +43,13 @@ class TargetStatus:
             return None
         return self.discovered_label_count - self.label_count
 
-    def conspicuous_flags(self, avg_metrics: float | None, avg_labels: float | None) -> list[str]:
-        above_metrics = avg_metrics is not None and self.metric_count is not None and self.metric_count > avg_metrics
-        above_labels = avg_labels is not None and self.label_count is not None and self.label_count > avg_labels
+    def conspicuous_flags(self, metric_threshold: float | None, label_threshold: float | None) -> list[str]:
+        above_metrics = (
+            metric_threshold is not None and self.metric_count is not None and self.metric_count > metric_threshold
+        )
+        above_labels = (
+            label_threshold is not None and self.label_count is not None and self.label_count > label_threshold
+        )
         if above_metrics and above_labels:
             return ["METRIKEN+LABELS"]
         if above_metrics:
@@ -50,6 +57,14 @@ class TargetStatus:
         if above_labels:
             return ["LABELS"]
         return []
+
+
+DEFAULT_CONSPICUOUS_FACTOR = 2.0
+
+
+def conspicuous_threshold(values: list[int], factor: float) -> float | None:
+    # Median statt Mittelwert: einzelne Ausreisser verschieben die Schwelle nicht
+    return statistics.median(values) * factor if values else None
 
 
 @dataclass
@@ -85,6 +100,50 @@ class RuntimeStatus:
     storage_retention: str | None
     corruption_count: int | None
     goroutine_count: int | None
+    server_time: str | None = None
+
+    @property
+    def uptime_seconds(self) -> float | None:
+        start = parse_timestamp(self.start_time)
+        if start is None:
+            return None
+        # serverTime vermeidet Abweichungen durch eine falsch gehende lokale Uhr
+        now = parse_timestamp(self.server_time) or datetime.now(timezone.utc)
+        return (now - start).total_seconds()
+
+
+_TIMESTAMP_RE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?(Z|[+-]\d\d:\d\d)$")
+
+
+def parse_timestamp(value: str | None) -> datetime | None:
+    # Go liefert Nanosekunden und "Z"; datetime.fromisoformat kann beides erst ab Python 3.11
+    match = _TIMESTAMP_RE.match(value or "")
+    if not match:
+        return None
+    base, tz = match.groups()
+    return datetime.fromisoformat(base + ("+00:00" if tz == "Z" else tz))
+
+
+def format_duration(seconds: float) -> str:
+    total = int(seconds)
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, secs = divmod(rest, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def format_bytes(value: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if abs(value) < 1024 or unit == "GiB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    raise AssertionError("unreachable")
 
 
 class PrometheusError(Exception):
@@ -136,8 +195,8 @@ class PrometheusClient:
         data = self._get("/api/v1/query", params={"query": promql})
         return data.get("result", [])
 
-    def tsdb_status(self) -> dict:
-        return self._get("/api/v1/status/tsdb")
+    def tsdb_status(self, limit: int | None = None) -> dict:
+        return self._get("/api/v1/status/tsdb", params={"limit": limit} if limit is not None else None)
 
     def runtime_info(self) -> dict:
         return self._get("/api/v1/status/runtimeinfo")
@@ -179,20 +238,31 @@ def collect_target_status(
     die Targets aus /api/v1/targets werden dann ohne Scrape-Werte zurueckgegeben."""
     targets = client.active_targets()
     metrics = query_metrics_by_target(
-        client, ["up", "scrape_samples_scraped", "scrape_duration_seconds", "scrape_series_added"], errors
+        client,
+        [
+            "up",
+            "scrape_samples_scraped",
+            "scrape_samples_post_metric_relabeling",
+            "scrape_duration_seconds",
+            "scrape_series_added",
+        ],
+        errors,
     )
     up = metrics["up"]
     samples_scraped = metrics["scrape_samples_scraped"]
+    samples_post_relabel = metrics["scrape_samples_post_metric_relabeling"]
     scrape_duration = metrics["scrape_duration_seconds"]
     series_added = metrics["scrape_series_added"]
 
     def build_status(key: TargetKey, **kwargs) -> TargetStatus:
         metric_value = samples_scraped.get(key)
+        post_relabel_value = samples_post_relabel.get(key)
         series_value = series_added.get(key)
         return TargetStatus(
             job=key.job,
             instance=key.instance,
             metric_count=int(metric_value) if metric_value is not None else None,
+            metric_count_post_relabel=int(post_relabel_value) if post_relabel_value is not None else None,
             scrape_duration=scrape_duration.get(key),
             series_added=int(series_value) if series_value is not None else None,
             **kwargs,
@@ -233,10 +303,11 @@ def collect_target_status(
 
 
 def collect_tsdb_status(client: PrometheusClient, top_n: int = 5) -> TsdbStatus:
-    data = client.tsdb_status()
+    data = client.tsdb_status(limit=top_n)
     head_stats = data.get("headStats", {})
 
     def top_entries(key: str) -> list[TsdbTopEntry]:
+        # Kuerzen nur als Absicherung fuer Prometheus-Versionen, die limit ignorieren
         return [
             TsdbTopEntry(name=str(entry.get("name", "?")), value=entry.get("value"))
             for entry in data.get(key, [])[:top_n]
@@ -261,10 +332,11 @@ def collect_runtime_status(client: PrometheusClient) -> RuntimeStatus:
         storage_retention=data.get("storageRetention"),
         corruption_count=data.get("corruptionCount"),
         goroutine_count=data.get("goroutineCount"),
+        server_time=data.get("serverTime"),
     )
 
 
-def print_report(statuses: list[TargetStatus]) -> None:
+def print_report(statuses: list[TargetStatus], factor: float = DEFAULT_CONSPICUOUS_FACTOR) -> None:
     if not statuses:
         print("Keine aktiven Targets gefunden.")
         return
@@ -272,15 +344,21 @@ def print_report(statuses: list[TargetStatus]) -> None:
     metric_counts = [s.metric_count for s in statuses if s.metric_count is not None]
     label_counts = [s.label_count for s in statuses if s.label_count is not None]
 
-    avg_metrics = statistics.mean(metric_counts) if metric_counts else None
-    avg_labels = statistics.mean(label_counts) if label_counts else None
+    metric_threshold = conspicuous_threshold(metric_counts, factor)
+    label_threshold = conspicuous_threshold(label_counts, factor)
 
     remote_count = sum(1 for s in statuses if s.source == SOURCE_REMOTE_WRITE)
     print(f"Targets: {len(statuses)} (davon {remote_count} per Remote-Write)")
-    if avg_metrics is not None:
-        print(f"Durchschnittliche Metrikanzahl je Target: {avg_metrics:.1f}")
-    if avg_labels is not None:
-        print(f"Durchschnittliche Labelanzahl je Target (nur gescrapte Targets): {avg_labels:.1f}")
+    if metric_threshold is not None:
+        print(
+            f"Metrikanzahl je Target: Median {statistics.median(metric_counts):.1f}, "
+            f"auffaellig ab > {metric_threshold:.1f} ({factor:g}x Median)"
+        )
+    if label_threshold is not None:
+        print(
+            f"Labelanzahl je Target (nur gescrapte Targets): Median {statistics.median(label_counts):.1f}, "
+            f"auffaellig ab > {label_threshold:.1f} ({factor:g}x Median)"
+        )
     print()
 
     def or_na(value) -> str:
@@ -288,13 +366,14 @@ def print_report(statuses: list[TargetStatus]) -> None:
 
     rows = []
     for s in sorted(statuses, key=lambda s: (s.metric_count or -1), reverse=True):
-        flags = s.conspicuous_flags(avg_metrics, avg_labels)
+        flags = s.conspicuous_flags(metric_threshold, label_threshold)
         rows.append(
             (
                 f"{s.job}/{s.instance}",
                 s.source,
                 s.health,
                 or_na(s.metric_count),
+                or_na(s.metric_count_post_relabel),
                 or_na(s.label_count),
                 or_na(s.discovered_label_count),
                 or_na(s.relabel_dropped_labels),
@@ -309,6 +388,7 @@ def print_report(statuses: list[TargetStatus]) -> None:
         "QUELLE",
         "HEALTH",
         "METRIKEN",
+        "GESPEICHERT",
         "LABELS",
         "LABELS_ROH",
         "RELABEL_ENTF",
@@ -328,7 +408,7 @@ def print_report(statuses: list[TargetStatus]) -> None:
     conspicuous = [r for r in rows if r[-1]]
     print()
     if conspicuous:
-        print(f"{len(conspicuous)} Target(s) auffaellig (ueberdurchschnittlich Metriken und/oder Labels).")
+        print(f"{len(conspicuous)} Target(s) auffaellig (Metriken und/oder Labels > {factor:g}x Median).")
     else:
         print("Keine auffaelligen Targets gefunden.")
 
@@ -356,18 +436,23 @@ def print_tsdb_report(client: PrometheusClient, top_n: int = 5) -> None:
         chunk_count = tsdb.chunk_count if tsdb.chunk_count is not None else "n/a"
         print(f"  Serien: {num_series}  Label-Paare: {num_label_pairs}  Chunks: {chunk_count}")
 
-    def print_top(title: str, entries: list[TsdbTopEntry]) -> None:
+    def print_top(title: str, entries: list[TsdbTopEntry], as_bytes: bool = False) -> None:
         print(f"  {title}:")
         if not entries:
             print("    (keine Daten)")
             return
         for entry in entries:
-            value = entry.value if entry.value is not None else "?"
+            if entry.value is None:
+                value = "?"
+            elif as_bytes:
+                value = format_bytes(float(entry.value))
+            else:
+                value = entry.value
             print(f"    {entry.name}: {value}")
 
     print_top(f"Top {top_n} Metriken nach Serienanzahl", tsdb.top_series_by_metric)
     print_top(f"Top {top_n} Labels nach Anzahl unterschiedlicher Werte (Cardinality)", tsdb.top_label_value_count)
-    print_top(f"Top {top_n} Labels nach Speicherverbrauch", tsdb.top_memory_by_label)
+    print_top(f"Top {top_n} Labels nach Speicherverbrauch", tsdb.top_memory_by_label, as_bytes=True)
 
 
 def print_runtime_report(client: PrometheusClient) -> None:
@@ -383,7 +468,9 @@ def print_runtime_report(client: PrometheusClient) -> None:
 
     print()
     print("Runtime-Info:")
-    print(f"  Startzeit: {or_na(runtime.start_time)}")
+    uptime = runtime.uptime_seconds
+    uptime_suffix = f" (Uptime: {format_duration(uptime)})" if uptime is not None else ""
+    print(f"  Startzeit: {or_na(runtime.start_time)}{uptime_suffix}")
     print(f"  Config-Reload erfolgreich: {or_na(runtime.reload_config_success)}")
     print(f"  Letzte Config-Aenderung: {or_na(runtime.last_config_time)}")
     print(f"  Storage-Retention: {or_na(runtime.storage_retention)}")
@@ -447,12 +534,18 @@ def create_client_or_exit(args: argparse.Namespace) -> PrometheusClient:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Zeigt den Status eines Prometheus-Servers und dessen Scrape-Targets an.")
     add_common_args(parser)
+    parser.add_argument(
+        "--factor",
+        type=float,
+        default=DEFAULT_CONSPICUOUS_FACTOR,
+        help=f"Target gilt als auffaellig ab diesem Vielfachen des Medians (Standard: {DEFAULT_CONSPICUOUS_FACTOR:g})",
+    )
     args = parser.parse_args()
 
     client = create_client_or_exit(args)
     try:
         statuses = collect_target_status(client)
-        print_report(statuses)
+        print_report(statuses, factor=args.factor)
         print_tsdb_report(client)
         print_runtime_report(client)
     except PrometheusError as exc:
