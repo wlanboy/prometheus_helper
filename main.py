@@ -17,21 +17,32 @@ class TargetKey(NamedTuple):
     instance: str
 
 
+SOURCE_SCRAPE = "scrape"
+SOURCE_REMOTE_WRITE = "remote_write"
+
+
 @dataclass
 class TargetStatus:
     job: str
     instance: str
+    source: str
     health: str
-    label_count: int
-    discovered_label_count: int
+    label_count: int | None
+    discovered_label_count: int | None
     metric_count: int | None
     scrape_duration: float | None
     series_added: int | None
     last_error: str
 
-    def conspicuous_flags(self, avg_metrics: float | None, avg_labels: float) -> list[str]:
+    @property
+    def relabel_dropped_labels(self) -> int | None:
+        if self.label_count is None or self.discovered_label_count is None:
+            return None
+        return self.discovered_label_count - self.label_count
+
+    def conspicuous_flags(self, avg_metrics: float | None, avg_labels: float | None) -> list[str]:
         above_metrics = avg_metrics is not None and self.metric_count is not None and self.metric_count > avg_metrics
-        above_labels = self.label_count > avg_labels
+        above_labels = avg_labels is not None and self.label_count is not None and self.label_count > avg_labels
         if above_metrics and above_labels:
             return ["METRIKEN+LABELS"]
         if above_metrics:
@@ -47,6 +58,7 @@ class PrometheusConfig:
     user: str | None
     password: str | None
     verify_ssl: bool
+    ca_bundle: str | None = None
 
 
 @dataclass
@@ -87,10 +99,12 @@ class PrometheusClient:
         password: str | None,
         verify_ssl: bool = True,
         timeout: float = 10.0,
+        ca_bundle: str | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.auth = (user, password) if user and password else None
-        self.verify_ssl = verify_ssl
+        # requests akzeptiert fuer verify entweder bool oder den Pfad zu einem CA-Bundle
+        self.verify_ssl: bool | str = ca_bundle if verify_ssl and ca_bundle else verify_ssl
         self.timeout = timeout
         if not verify_ssl:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -151,35 +165,52 @@ def query_metric_by_target(client: PrometheusClient, metric_name: str) -> dict[T
 
 def collect_target_status(client: PrometheusClient) -> list[TargetStatus]:
     targets = client.active_targets()
+    up = query_metric_by_target(client, "up")
     samples_scraped = query_metric_by_target(client, "scrape_samples_scraped")
     scrape_duration = query_metric_by_target(client, "scrape_duration_seconds")
     series_added = query_metric_by_target(client, "scrape_series_added")
 
+    def build_status(key: TargetKey, **kwargs) -> TargetStatus:
+        metric_value = samples_scraped.get(key)
+        series_value = series_added.get(key)
+        return TargetStatus(
+            job=key.job,
+            instance=key.instance,
+            metric_count=int(metric_value) if metric_value is not None else None,
+            scrape_duration=scrape_duration.get(key),
+            series_added=int(series_value) if series_value is not None else None,
+            **kwargs,
+        )
+
     statuses = []
     for target in targets:
         labels = target.get("labels", {})
-        discovered_labels = target.get("discoveredLabels", {})
-        job = labels.get("job", "unknown")
-        instance = labels.get("instance", "unknown")
-        health = target.get("health", "unknown")
-        last_error = target.get("lastError", "")
-        key = TargetKey(job, instance)
-
-        metric_value = samples_scraped.get(key)
-        duration_value = scrape_duration.get(key)
-        series_value = series_added.get(key)
-
+        key = TargetKey(labels.get("job", "unknown"), labels.get("instance", "unknown"))
         statuses.append(
-            TargetStatus(
-                job=job,
-                instance=instance,
-                health=health,
+            build_status(
+                key,
+                source=SOURCE_SCRAPE,
+                health=target.get("health", "unknown"),
                 label_count=len(labels),
-                discovered_label_count=len(discovered_labels),
-                metric_count=int(metric_value) if metric_value is not None else None,
-                scrape_duration=duration_value,
-                series_added=int(series_value) if series_value is not None else None,
-                last_error=last_error,
+                discovered_label_count=len(target.get("discoveredLabels", {})),
+                last_error=target.get("lastError", ""),
+            )
+        )
+
+    # Per Remote-Write eingelieferte Scrapes (z.B. Grafana Alloy) tauchen nicht in /api/v1/targets auf,
+    # hinterlassen aber up/scrape_*-Serien. Labels und Fehlertext sind fuer diese nicht bekannt.
+    known = {TargetKey(s.job, s.instance) for s in statuses}
+    remote_keys = (up.keys() | samples_scraped.keys()) - known
+    for key in sorted(remote_keys):
+        up_value = up.get(key)
+        statuses.append(
+            build_status(
+                key,
+                source=SOURCE_REMOTE_WRITE,
+                health="n/a" if up_value is None else ("up" if up_value == 1 else "down"),
+                label_count=None,
+                discovered_label_count=None,
+                last_error="",
             )
         )
     return statuses
@@ -223,16 +254,21 @@ def print_report(statuses: list[TargetStatus]) -> None:
         return
 
     metric_counts = [s.metric_count for s in statuses if s.metric_count is not None]
-    label_counts = [s.label_count for s in statuses]
+    label_counts = [s.label_count for s in statuses if s.label_count is not None]
 
     avg_metrics = statistics.mean(metric_counts) if metric_counts else None
-    avg_labels = statistics.mean(label_counts) if label_counts else 0
+    avg_labels = statistics.mean(label_counts) if label_counts else None
 
-    print(f"Aktive Targets: {len(statuses)}")
+    remote_count = sum(1 for s in statuses if s.source == SOURCE_REMOTE_WRITE)
+    print(f"Targets: {len(statuses)} (davon {remote_count} per Remote-Write)")
     if avg_metrics is not None:
         print(f"Durchschnittliche Metrikanzahl je Target: {avg_metrics:.1f}")
-    print(f"Durchschnittliche Labelanzahl je Target: {avg_labels:.1f}")
+    if avg_labels is not None:
+        print(f"Durchschnittliche Labelanzahl je Target (nur gescrapte Targets): {avg_labels:.1f}")
     print()
+
+    def or_na(value) -> str:
+        return str(value) if value is not None else "n/a"
 
     rows = []
     for s in sorted(statuses, key=lambda s: (s.metric_count or -1), reverse=True):
@@ -240,19 +276,21 @@ def print_report(statuses: list[TargetStatus]) -> None:
         rows.append(
             (
                 f"{s.job}/{s.instance}",
+                s.source,
                 s.health,
-                str(s.metric_count) if s.metric_count is not None else "n/a",
-                str(s.label_count),
-                str(s.discovered_label_count),
-                str(s.discovered_label_count - s.label_count),
+                or_na(s.metric_count),
+                or_na(s.label_count),
+                or_na(s.discovered_label_count),
+                or_na(s.relabel_dropped_labels),
                 f"{s.scrape_duration:.3f}" if s.scrape_duration is not None else "n/a",
-                str(s.series_added) if s.series_added is not None else "n/a",
+                or_na(s.series_added),
                 ", ".join(flags),
             )
         )
 
     headers = (
         "TARGET",
+        "QUELLE",
         "HEALTH",
         "METRIKEN",
         "LABELS",
@@ -278,12 +316,12 @@ def print_report(statuses: list[TargetStatus]) -> None:
     else:
         print("Keine auffaelligen Targets gefunden.")
 
-    failing = [s for s in statuses if s.last_error]
+    failing = [s for s in statuses if s.last_error or s.health == "down"]
     if failing:
         print()
         print(f"Targets mit Scrape-Fehler ({len(failing)}):")
         for s in failing:
-            print(f"  {s.job}/{s.instance}: {s.last_error}")
+            print(f"  {s.job}/{s.instance}: {s.last_error or '(up == 0, kein Fehlertext verfuegbar)'}")
 
 
 def print_tsdb_report(client: PrometheusClient, top_n: int = 5) -> None:
@@ -351,12 +389,16 @@ def load_config(env_file: str | None) -> PrometheusConfig:
     user = os.getenv("PROMETHEUS_USER")
     password = os.getenv("PROMETHEUS_PASSWORD")
     verify_ssl = str_to_bool(os.getenv("PROMETHEUS_VERIFY_SSL", "true"))
-    return PrometheusConfig(url=url, user=user, password=password, verify_ssl=verify_ssl)
+    ca_bundle = os.getenv("PROMETHEUS_CA_BUNDLE") or None
+    return PrometheusConfig(url=url, user=user, password=password, verify_ssl=verify_ssl, ca_bundle=ca_bundle)
 
 
-def build_client(config: PrometheusConfig, insecure: bool = False) -> PrometheusClient:
+def build_client(config: PrometheusConfig, insecure: bool = False, ca_file: str | None = None) -> PrometheusClient:
     verify_ssl = False if insecure else config.verify_ssl
-    return PrometheusClient(config.url, config.user, config.password, verify_ssl=verify_ssl)
+    ca_bundle = ca_file or config.ca_bundle
+    if verify_ssl and ca_bundle and not os.path.isfile(ca_bundle):
+        raise PrometheusError(f"CA-Bundle {ca_bundle} existiert nicht.")
+    return PrometheusClient(config.url, config.user, config.password, verify_ssl=verify_ssl, ca_bundle=ca_bundle)
 
 
 def exit_with_error(exc: PrometheusError) -> None:
@@ -371,12 +413,16 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="SSL-Zertifikatspruefung deaktivieren (z.B. bei selbstsignierten Zertifikaten)",
     )
+    parser.add_argument(
+        "--ca-file",
+        help="Pfad zu einem CA-Bundle fuer die Zertifikatspruefung (ueberschreibt PROMETHEUS_CA_BUNDLE)",
+    )
 
 
 def create_client_or_exit(args: argparse.Namespace) -> PrometheusClient:
     try:
         config = load_config(args.env_file)
-        return build_client(config, insecure=args.insecure)
+        return build_client(config, insecure=args.insecure, ca_file=args.ca_file)
     except PrometheusError as exc:
         exit_with_error(exc)
         raise AssertionError("unreachable")

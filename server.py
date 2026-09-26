@@ -50,6 +50,11 @@ class PrometheusHelperCollector:
             "Health-Status eines Scrape-Targets (1 = up, 0 = nicht up)",
             labels=["job", "instance"],
         )
+        target_info = GaugeMetricFamily(
+            "prometheus_helper_target_info",
+            "Herkunft eines Targets (source = scrape oder remote_write), Wert immer 1",
+            labels=["job", "instance", "source"],
+        )
         target_labels = GaugeMetricFamily(
             "prometheus_helper_target_label_count",
             "Anzahl Labels eines Scrape-Targets nach dem Relabeling",
@@ -93,12 +98,15 @@ class PrometheusHelperCollector:
             statuses = []
 
         for s in statuses:
-            target_up.add_metric([s.job, s.instance], 1.0 if s.health == "up" else 0.0)
-            target_labels.add_metric([s.job, s.instance], s.label_count)
-            target_discovered_labels.add_metric([s.job, s.instance], s.discovered_label_count)
-            target_relabel_dropped_labels.add_metric(
-                [s.job, s.instance], s.discovered_label_count - s.label_count
-            )
+            target_info.add_metric([s.job, s.instance, s.source], 1.0)
+            if s.health != "n/a":
+                target_up.add_metric([s.job, s.instance], 1.0 if s.health == "up" else 0.0)
+            if s.label_count is not None:
+                target_labels.add_metric([s.job, s.instance], s.label_count)
+            if s.discovered_label_count is not None:
+                target_discovered_labels.add_metric([s.job, s.instance], s.discovered_label_count)
+            if s.relabel_dropped_labels is not None:
+                target_relabel_dropped_labels.add_metric([s.job, s.instance], s.relabel_dropped_labels)
             if s.metric_count is not None:
                 target_metrics.add_metric([s.job, s.instance], s.metric_count)
             if s.scrape_duration is not None:
@@ -106,9 +114,10 @@ class PrometheusHelperCollector:
             if s.series_added is not None:
                 target_series_added.add_metric([s.job, s.instance], s.series_added)
             target_last_error.add_metric(
-                [s.job, s.instance, s.last_error], 1.0 if s.last_error else 0.0
+                [s.job, s.instance, s.last_error], 1.0 if s.last_error or s.health == "down" else 0.0
             )
 
+        yield target_info
         yield target_up
         yield target_labels
         yield target_discovered_labels

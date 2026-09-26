@@ -8,6 +8,8 @@ Kommandozeilen-Tool, das den Status eines Prometheus-Servers abfragt und einen �
 - Anzahl neu hinzugekommener Serien pro Scrape (`scrape_series_added`)
 - letzter Scrape-Fehler (`lastError`)
 
+Neben den aktiven Targets aus `/api/v1/targets` werden auch Targets berücksichtigt, deren Scrape-Ergebnisse nur per Remote-Write ankommen (z. B. von Grafana Alloy). Sie werden über die Serien `up`/`scrape_samples_scraped` erkannt und mit der Quelle `remote_write` gekennzeichnet. Labelanzahl und Fehlertext sind für sie nicht verfügbar; die Health wird aus `up` abgeleitet.
+
 Targets, deren Metrik- und/oder Labelanzahl über dem Durchschnitt aller Targets liegt, werden in der Ausgabe als auffällig markiert – so lassen sich Targets identifizieren, die besonders viele Metriken oder besonders viele Labels liefern. Targets mit fehlgeschlagenem letzten Scrape werden gesondert aufgelistet.
 
 Zusätzlich wird eine globale TSDB-Übersicht (`/api/v1/status/tsdb`) ausgegeben: Serien-/Label-Paar-/Chunk-Anzahl sowie die Top-Metriken und -Labels nach Serienanzahl und Speicherverbrauch – nützlich, um Cardinality-Probleme unabhängig von einzelnen Targets zu erkennen.
@@ -40,8 +42,9 @@ Anschließend in der `.env` anpassen:
 | `PROMETHEUS_USER` | nein | Benutzername für Basic Auth |
 | `PROMETHEUS_PASSWORD` | nein | Passwort für Basic Auth |
 | `PROMETHEUS_VERIFY_SSL` | nein | `true`/`false` – SSL-Zertifikatsprüfung aktivieren/deaktivieren (Standard: `true`) |
+| `PROMETHEUS_CA_BUNDLE` | nein | Pfad zu einem CA-Bundle, z. B. `/etc/ssl/certs/ca-certificates.crt` für eine eigene CA |
 
-Bei selbstsignierten Zertifikaten `PROMETHEUS_VERIFY_SSL=false` setzen oder das CLI-Flag `--insecure` verwenden.
+Ist das Zertifikat von einer eigenen CA signiert, `PROMETHEUS_CA_BUNDLE` bzw. `--ca-file` auf das CA-Bundle setzen. `requests` nutzt standardmäßig nur das certifi-Bundle und nicht den System-Store. Nur als Notlösung: `PROMETHEUS_VERIFY_SSL=false` oder `--insecure`.
 
 ## Starten
 
@@ -54,6 +57,7 @@ Optionale Parameter:
 ```bash
 uv run main.py --env-file /pfad/zu/anderer.env   # abweichende .env-Datei verwenden
 uv run main.py --insecure                        # SSL-Zertifikatsprüfung für diesen Lauf deaktivieren
+uv run main.py --ca-file /pfad/zu/ca.pem         # CA-Bundle für die Zertifikatsprüfung
 ```
 
 ## Metrik-Endpunkt (`server.py`)
@@ -77,6 +81,7 @@ Bereitgestellte Metriken:
 
 | Metrik | Beschreibung |
 |---|---|
+| `prometheus_helper_target_info{job,instance,source}` | Herkunft des Targets (`scrape` oder `remote_write`), Wert immer 1 |
 | `prometheus_helper_target_up{job,instance}` | 1 = Target-Health `up`, sonst 0 |
 | `prometheus_helper_target_label_count{job,instance}` | Anzahl der Target-Labels nach dem Relabeling |
 | `prometheus_helper_target_discovered_label_count{job,instance}` | Anzahl der Target-Labels vor dem Relabeling (`discoveredLabels`) |
@@ -84,7 +89,7 @@ Bereitgestellte Metriken:
 | `prometheus_helper_target_metric_count{job,instance}` | Anzahl gescrapter Metriken (`scrape_samples_scraped`) |
 | `prometheus_helper_target_scrape_duration_seconds{job,instance}` | Scrape-Dauer (`scrape_duration_seconds`) |
 | `prometheus_helper_target_series_added{job,instance}` | Neue Serien pro Scrape (`scrape_series_added`) |
-| `prometheus_helper_target_last_scrape_error{job,instance,error}` | 1 wenn letzter Scrape fehlgeschlagen ist |
+| `prometheus_helper_target_last_scrape_error{job,instance,error}` | 1 wenn letzter Scrape fehlgeschlagen ist (bei Remote-Write-Targets: `up == 0`, `error` leer) |
 | `prometheus_helper_tsdb_head_series` | Serienanzahl im TSDB-Head |
 | `prometheus_helper_tsdb_head_label_pairs` | Label-Paar-Anzahl im TSDB-Head |
 | `prometheus_helper_tsdb_head_chunks` | Chunk-Anzahl im TSDB-Head |
