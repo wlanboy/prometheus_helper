@@ -4,6 +4,7 @@ import argparse
 import re
 import sys
 import time
+from typing import Callable, TypeVar
 
 from prometheus_client import start_http_server
 from prometheus_client.core import REGISTRY, GaugeMetricFamily
@@ -20,7 +21,9 @@ from main import (
     create_client_or_exit,
 )
 
-_DURATION_RE = re.compile(r"(\d+)(ms|s|m|h|d|w|y)")
+T = TypeVar("T")
+
+_DURATION_RE =re.compile(r"(\d+)(ms|s|m|h|d|w|y)")
 _DURATION_UNIT_SECONDS = {
     "ms": 0.001,
     "s": 1,
@@ -44,7 +47,40 @@ class PrometheusHelperCollector:
         self.client = client
         self.top_n = top_n
 
+    @staticmethod
+    def _fetch(
+        section: str,
+        fetch: Callable[[list[PrometheusError]], T],
+        default: T,
+        success: GaugeMetricFamily,
+        duration: GaugeMetricFamily,
+    ) -> T:
+        """Fuehrt fetch aus und erfasst Dauer und Erfolg. fetch kann Teilfehler in die uebergebene Liste
+        eintragen, ohne abzubrechen; auch dann gilt der Abschnitt als nicht erfolgreich."""
+        errors: list[PrometheusError] = []
+        start = time.perf_counter()
+        try:
+            result = fetch(errors)
+        except PrometheusError as exc:
+            print(f"Fehler beim Abfragen von '{section}': {exc}", file=sys.stderr)
+            errors.append(exc)
+            result = default
+        duration.add_metric([section], time.perf_counter() - start)
+        success.add_metric([section], 0.0 if errors else 1.0)
+        return result
+
     def collect(self):
+        scrape_success = GaugeMetricFamily(
+            "prometheus_helper_scrape_success",
+            "1 wenn die Abfrage des Abschnitts (targets, tsdb, runtime) vollstaendig erfolgreich war, sonst 0",
+            labels=["section"],
+        )
+        scrape_duration = GaugeMetricFamily(
+            "prometheus_helper_scrape_duration_seconds",
+            "Dauer der Abfrage eines Abschnitts (targets, tsdb, runtime) in Sekunden",
+            labels=["section"],
+        )
+
         target_up = GaugeMetricFamily(
             "prometheus_helper_target_up",
             "Health-Status eines Scrape-Targets (1 = up, 0 = nicht up)",
@@ -87,15 +123,17 @@ class PrometheusHelperCollector:
         )
         target_last_error = GaugeMetricFamily(
             "prometheus_helper_target_last_scrape_error",
-            "1 wenn beim letzten Scrape ein Fehler auftrat, sonst 0",
-            labels=["job", "instance", "error"],
+            "1 wenn beim letzten Scrape ein Fehler auftrat, sonst 0 (Fehlertext: main.py)",
+            labels=["job", "instance"],
         )
 
-        try:
-            statuses = collect_target_status(self.client)
-        except PrometheusError as exc:
-            print(f"Fehler beim Abfragen der Targets: {exc}", file=sys.stderr)
-            statuses = []
+        statuses = self._fetch(
+            "targets",
+            lambda errors: collect_target_status(self.client, errors),
+            [],
+            scrape_success,
+            scrape_duration,
+        )
 
         for s in statuses:
             target_info.add_metric([s.job, s.instance, s.source], 1.0)
@@ -114,7 +152,7 @@ class PrometheusHelperCollector:
             if s.series_added is not None:
                 target_series_added.add_metric([s.job, s.instance], s.series_added)
             target_last_error.add_metric(
-                [s.job, s.instance, s.last_error], 1.0 if s.last_error or s.health == "down" else 0.0
+                [s.job, s.instance], 1.0 if s.last_error or s.health == "down" else 0.0
             )
 
         yield target_info
@@ -127,11 +165,13 @@ class PrometheusHelperCollector:
         yield target_series_added
         yield target_last_error
 
-        try:
-            tsdb = collect_tsdb_status(self.client, top_n=self.top_n)
-        except PrometheusError as exc:
-            print(f"Fehler beim Abfragen des TSDB-Status: {exc}", file=sys.stderr)
-            tsdb = TsdbStatus(None, None, None, [], [], [])
+        tsdb = self._fetch(
+            "tsdb",
+            lambda _errors: collect_tsdb_status(self.client, top_n=self.top_n),
+            TsdbStatus(None, None, None, [], [], []),
+            scrape_success,
+            scrape_duration,
+        )
 
         head_series = GaugeMetricFamily(
             "prometheus_helper_tsdb_head_series", "Anzahl Serien im TSDB-Head"
@@ -178,11 +218,13 @@ class PrometheusHelperCollector:
             tsdb.top_memory_by_label,
         )
 
-        try:
-            runtime = collect_runtime_status(self.client)
-        except PrometheusError as exc:
-            print(f"Fehler beim Abfragen der Runtime-Info: {exc}", file=sys.stderr)
-            runtime = RuntimeStatus(None, None, None, None, None, None)
+        runtime = self._fetch(
+            "runtime",
+            lambda _errors: collect_runtime_status(self.client),
+            RuntimeStatus(None, None, None, None, None, None),
+            scrape_success,
+            scrape_duration,
+        )
 
         reload_success = GaugeMetricFamily(
             "prometheus_helper_runtime_reload_config_success",
@@ -216,6 +258,9 @@ class PrometheusHelperCollector:
         if retention_value is not None:
             retention_seconds.add_metric([], retention_value)
         yield retention_seconds
+
+        yield scrape_success
+        yield scrape_duration
 
 
 def main() -> None:

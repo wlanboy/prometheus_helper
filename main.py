@@ -143,13 +143,19 @@ class PrometheusClient:
         return self._get("/api/v1/status/runtimeinfo")
 
 
-def query_metrics_by_target(client: PrometheusClient, metric_names: list[str]) -> dict[str, dict[TargetKey, float]]:
+def query_metrics_by_target(
+    client: PrometheusClient,
+    metric_names: list[str],
+    errors: list[PrometheusError] | None = None,
+) -> dict[str, dict[TargetKey, float]]:
     values: dict[str, dict[TargetKey, float]] = {name: {} for name in metric_names}
     promql = '{__name__=~"' + "|".join(metric_names) + '"}'
     try:
         result = client.instant_query(promql)
     except PrometheusError as exc:
         print(f"Warnung: Abfrage von {', '.join(metric_names)} fehlgeschlagen: {exc}", file=sys.stderr)
+        if errors is not None:
+            errors.append(exc)
         return values
 
     for entry in result:
@@ -166,10 +172,14 @@ def query_metrics_by_target(client: PrometheusClient, metric_names: list[str]) -
     return values
 
 
-def collect_target_status(client: PrometheusClient) -> list[TargetStatus]:
+def collect_target_status(
+    client: PrometheusClient, errors: list[PrometheusError] | None = None
+) -> list[TargetStatus]:
+    """Fehler der Query-API werden nicht geworfen, sondern (falls uebergeben) in errors gesammelt;
+    die Targets aus /api/v1/targets werden dann ohne Scrape-Werte zurueckgegeben."""
     targets = client.active_targets()
     metrics = query_metrics_by_target(
-        client, ["up", "scrape_samples_scraped", "scrape_duration_seconds", "scrape_series_added"]
+        client, ["up", "scrape_samples_scraped", "scrape_duration_seconds", "scrape_series_added"], errors
     )
     up = metrics["up"]
     samples_scraped = metrics["scrape_samples_scraped"]

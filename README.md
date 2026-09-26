@@ -89,7 +89,7 @@ Bereitgestellte Metriken:
 | `prometheus_helper_target_metric_count{job,instance}` | Anzahl gescrapter Metriken (`scrape_samples_scraped`) |
 | `prometheus_helper_target_scrape_duration_seconds{job,instance}` | Scrape-Dauer (`scrape_duration_seconds`) |
 | `prometheus_helper_target_series_added{job,instance}` | Neue Serien pro Scrape (`scrape_series_added`) |
-| `prometheus_helper_target_last_scrape_error{job,instance,error}` | 1 wenn letzter Scrape fehlgeschlagen ist (bei Remote-Write-Targets: `up == 0`, `error` leer) |
+| `prometheus_helper_target_last_scrape_error{job,instance}` | 1 wenn letzter Scrape fehlgeschlagen ist (bei Remote-Write-Targets: `up == 0`). Den Fehlertext zeigt `main.py`; als Label würde er pro Fehlermeldung eine neue Serie erzeugen |
 | `prometheus_helper_tsdb_head_series` | Serienanzahl im TSDB-Head |
 | `prometheus_helper_tsdb_head_label_pairs` | Label-Paar-Anzahl im TSDB-Head |
 | `prometheus_helper_tsdb_head_chunks` | Chunk-Anzahl im TSDB-Head |
@@ -100,3 +100,13 @@ Bereitgestellte Metriken:
 | `prometheus_helper_runtime_goroutines` | Anzahl laufender Goroutinen im Prometheus-Prozess |
 | `prometheus_helper_runtime_corruptions_total` | Anzahl erkannter WAL-/Storage-Korruptionen (`corruptionCount`) |
 | `prometheus_helper_runtime_storage_retention_seconds` | Konfigurierte Storage-Retention in Sekunden (aus `storageRetention`, z. B. `15d`) |
+| `prometheus_helper_scrape_success{section}` | 1 wenn die Abfrage des Abschnitts (`targets`, `tsdb`, `runtime`) vollständig erfolgreich war, sonst 0 – auch bei Teilfehlern wie gestörter Query-API |
+| `prometheus_helper_scrape_duration_seconds{section}` | Dauer der Abfrage je Abschnitt in Sekunden |
+
+Beispiel-Alert, der anschlägt, wenn der Helper den Ziel-Prometheus nicht (vollständig) abfragen kann:
+
+```yaml
+- alert: PrometheusHelperScrapeFailed
+  expr: prometheus_helper_scrape_success == 0
+  for: 5m
+```
