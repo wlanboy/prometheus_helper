@@ -102,19 +102,19 @@ class PrometheusClient:
         ca_bundle: str | None = None,
     ):
         self.base_url = base_url.rstrip("/")
-        self.auth = (user, password) if user and password else None
-        # requests akzeptiert fuer verify entweder bool oder den Pfad zu einem CA-Bundle
-        self.verify_ssl: bool | str = ca_bundle if verify_ssl and ca_bundle else verify_ssl
         self.timeout = timeout
+        # Eine Session haelt die TLS-Verbindung ueber alle API-Aufrufe hinweg offen
+        self.session = requests.Session()
+        self.session.auth = (user, password) if user and password else None
+        # requests akzeptiert fuer verify entweder bool oder den Pfad zu einem CA-Bundle
+        self.session.verify = ca_bundle if verify_ssl and ca_bundle else verify_ssl
         if not verify_ssl:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     def _get(self, path: str, params: dict | None = None) -> dict:
         url = f"{self.base_url}{path}"
         try:
-            response = requests.get(
-                url, params=params, auth=self.auth, timeout=self.timeout, verify=self.verify_ssl
-            )
+            response = self.session.get(url, params=params, timeout=self.timeout)
         except requests.exceptions.RequestException as exc:
             raise PrometheusError(f"Verbindung zu {url} fehlgeschlagen: {exc}") from exc
 
@@ -143,21 +143,24 @@ class PrometheusClient:
         return self._get("/api/v1/status/runtimeinfo")
 
 
-def query_metric_by_target(client: PrometheusClient, metric_name: str) -> dict[TargetKey, float]:
-    values: dict[TargetKey, float] = {}
+def query_metrics_by_target(client: PrometheusClient, metric_names: list[str]) -> dict[str, dict[TargetKey, float]]:
+    values: dict[str, dict[TargetKey, float]] = {name: {} for name in metric_names}
+    promql = '{__name__=~"' + "|".join(metric_names) + '"}'
     try:
-        result = client.instant_query(metric_name)
-    except PrometheusError:
+        result = client.instant_query(promql)
+    except PrometheusError as exc:
+        print(f"Warnung: Abfrage von {', '.join(metric_names)} fehlgeschlagen: {exc}", file=sys.stderr)
         return values
 
     for entry in result:
         metric = entry.get("metric", {})
+        name = metric.get("__name__")
         job = metric.get("job")
         instance = metric.get("instance")
-        if job is None or instance is None:
+        if name not in values or job is None or instance is None:
             continue
         try:
-            values[TargetKey(job, instance)] = float(entry["value"][1])
+            values[name][TargetKey(job, instance)] = float(entry["value"][1])
         except (KeyError, IndexError, ValueError):
             continue
     return values
@@ -165,10 +168,13 @@ def query_metric_by_target(client: PrometheusClient, metric_name: str) -> dict[T
 
 def collect_target_status(client: PrometheusClient) -> list[TargetStatus]:
     targets = client.active_targets()
-    up = query_metric_by_target(client, "up")
-    samples_scraped = query_metric_by_target(client, "scrape_samples_scraped")
-    scrape_duration = query_metric_by_target(client, "scrape_duration_seconds")
-    series_added = query_metric_by_target(client, "scrape_series_added")
+    metrics = query_metrics_by_target(
+        client, ["up", "scrape_samples_scraped", "scrape_duration_seconds", "scrape_series_added"]
+    )
+    up = metrics["up"]
+    samples_scraped = metrics["scrape_samples_scraped"]
+    scrape_duration = metrics["scrape_duration_seconds"]
+    series_added = metrics["scrape_series_added"]
 
     def build_status(key: TargetKey, **kwargs) -> TargetStatus:
         metric_value = samples_scraped.get(key)
