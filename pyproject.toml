@@ -5,15 +5,15 @@ description = "Prometheus health checker"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "python-dotenv>=1.2.1",
-    "requests>=2.32.5",
+    "python-dotenv>=1.2.4",
+    "requests>=2.34.2",
     "prometheus-client>=0.26.0",
 ]
 
 [dependency-groups]
 dev = [
     "pyright>=1.1.414",
-    "pytest>=8.4.2",
+    "pytest>=9.2.0",
     "ruff>=0.17.4",
 ]
 
