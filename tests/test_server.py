@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from conftest import FakeClient, sample
@@ -123,11 +123,11 @@ class TestCollector:
         metrics = collect(healthy_client())
 
         assert metrics["prometheus_helper_runtime_start_time_seconds"] == {
-            (): datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()
+            (): datetime(2026, 1, 1, 0, 0, 0, 123000, tzinfo=UTC).timestamp()
         }
         assert metrics["prometheus_helper_runtime_reload_config_success"] == {(): 0.0}
         assert metrics["prometheus_helper_runtime_goroutines"] == {(): 77}
-        assert metrics["prometheus_helper_runtime_corruptions_total"] == {(): 1}
+        assert metrics["prometheus_helper_runtime_corruptions"] == {(): 1}
         assert metrics["prometheus_helper_runtime_storage_retention_seconds"] == {(): 15 * 86400}
 
     def test_all_sections_successful(self):

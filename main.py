@@ -6,7 +6,7 @@ import re
 import statistics
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import NamedTuple
 
 import requests
@@ -17,6 +17,8 @@ from dotenv import load_dotenv
 class TargetKey(NamedTuple):
     job: str
     instance: str
+    # Werte der per --key-label zusaetzlich unterschiedenen Labels, in Reihenfolge von key_labels
+    extra: tuple[str, ...] = ()
 
 
 SOURCE_SCRAPE = "scrape"
@@ -36,6 +38,11 @@ class TargetStatus:
     scrape_duration: float | None
     series_added: int | None
     last_error: str
+    key_values: tuple[str, ...] = ()
+
+    def display_name(self, key_labels: tuple[str, ...] = ()) -> str:
+        extra = "".join(f" {name}={value}" for name, value in zip(key_labels, self.key_values))
+        return f"{self.job}/{self.instance}{extra}"
 
     @property
     def relabel_dropped_labels(self) -> int | None:
@@ -74,6 +81,7 @@ class PrometheusConfig:
     password: str | None
     verify_ssl: bool
     ca_bundle: str | None = None
+    token: str | None = None
 
 
 @dataclass
@@ -108,20 +116,20 @@ class RuntimeStatus:
         if start is None:
             return None
         # serverTime vermeidet Abweichungen durch eine falsch gehende lokale Uhr
-        now = parse_timestamp(self.server_time) or datetime.now(timezone.utc)
+        now = parse_timestamp(self.server_time) or datetime.now(UTC)
         return (now - start).total_seconds()
 
 
-_TIMESTAMP_RE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?(Z|[+-]\d\d:\d\d)$")
-
-
 def parse_timestamp(value: str | None) -> datetime | None:
-    # Go liefert Nanosekunden und "Z"; datetime.fromisoformat kann beides erst ab Python 3.11
-    match = _TIMESTAMP_RE.match(value or "")
-    if not match:
+    # Go liefert Nanosekunden und "Z"; datetime.fromisoformat verarbeitet beides seit Python 3.11
+    if not value:
         return None
-    base, tz = match.groups()
-    return datetime.fromisoformat(base + ("+00:00" if tz == "Z" else tz))
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    # Ohne Zeitzone liesse sich der Zeitpunkt nicht eindeutig einordnen
+    return parsed if parsed.tzinfo is not None else None
 
 
 def format_duration(seconds: float) -> str:
@@ -150,6 +158,9 @@ class PrometheusError(Exception):
     pass
 
 
+DEFAULT_TIMEOUT = 10.0
+
+
 class PrometheusClient:
     def __init__(
         self,
@@ -157,14 +168,20 @@ class PrometheusClient:
         user: str | None,
         password: str | None,
         verify_ssl: bool = True,
-        timeout: float = 10.0,
+        timeout: float = DEFAULT_TIMEOUT,
         ca_bundle: str | None = None,
+        token: str | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         # Eine Session haelt die TLS-Verbindung ueber alle API-Aufrufe hinweg offen
         self.session = requests.Session()
-        self.session.auth = (user, password) if user and password else None
+        if token:
+            # Bearer-Token (z.B. OpenShift, OAuth-Proxy) hat Vorrang vor Basic Auth
+            self.session.auth = None
+            self.session.headers["Authorization"] = f"Bearer {token}"
+        else:
+            self.session.auth = (user, password) if user and password else None
         # requests akzeptiert fuer verify entweder bool oder den Pfad zu einem CA-Bundle
         self.session.verify = ca_bundle if verify_ssl and ca_bundle else verify_ssl
         if not verify_ssl:
@@ -178,14 +195,26 @@ class PrometheusClient:
             raise PrometheusError(f"Verbindung zu {url} fehlgeschlagen: {exc}") from exc
 
         if response.status_code == 401:
-            raise PrometheusError("Authentifizierung fehlgeschlagen (401) - Basic Auth Zugangsdaten pruefen")
+            raise PrometheusError("Authentifizierung fehlgeschlagen (401) - Zugangsdaten bzw. Token pruefen")
         if not response.ok:
             raise PrometheusError(f"{url} antwortete mit HTTP {response.status_code}: {response.text[:200]}")
 
-        payload = response.json()
+        # Reverse-Proxies oder SSO-Loginseiten liefern oft HTML mit Status 200
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            content_type = response.headers.get("Content-Type", "unbekannt")
+            raise PrometheusError(
+                f"{url} lieferte kein JSON (Content-Type: {content_type}): {response.text[:200]}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise PrometheusError(f"{url} lieferte unerwartetes JSON: {str(payload)[:200]}")
         if payload.get("status") != "success":
             raise PrometheusError(f"Prometheus meldete Fehler: {payload.get('error', payload)}")
-        return payload["data"]
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise PrometheusError(f"{url} lieferte kein 'data'-Objekt: {str(payload)[:200]}")
+        return data
 
     def active_targets(self) -> list[dict]:
         data = self._get("/api/v1/targets", params={"state": "active"})
@@ -206,6 +235,7 @@ def query_metrics_by_target(
     client: PrometheusClient,
     metric_names: list[str],
     errors: list[PrometheusError] | None = None,
+    key_labels: tuple[str, ...] = (),
 ) -> dict[str, dict[TargetKey, float]]:
     values: dict[str, dict[TargetKey, float]] = {name: {} for name in metric_names}
     promql = '{__name__=~"' + "|".join(metric_names) + '"}'
@@ -217,6 +247,7 @@ def query_metrics_by_target(
             errors.append(exc)
         return values
 
+    duplicates: dict[str, set[TargetKey]] = {}
     for entry in result:
         metric = entry.get("metric", {})
         name = metric.get("__name__")
@@ -224,15 +255,33 @@ def query_metrics_by_target(
         instance = metric.get("instance")
         if name not in values or job is None or instance is None:
             continue
+        key = TargetKey(job, instance, tuple(metric.get(label, "") for label in key_labels))
         try:
-            values[name][TargetKey(job, instance)] = float(entry["value"][1])
+            value = float(entry["value"][1])
         except (KeyError, IndexError, ValueError):
             continue
+        if key in values[name]:
+            duplicates.setdefault(name, set()).add(key)
+        values[name][key] = value
+
+    if duplicates:
+        # Z.B. mehrere Alloy-Agents/Cluster, die per Remote-Write gleiche job/instance-Paare schicken
+        keys = set().union(*duplicates.values())
+        key_desc = "/".join(("job", "instance", *key_labels))
+        example = min(keys)
+        print(
+            f"Warnung: {len(keys)} Target(s) mit mehreren Serien je {key_desc}, nur ein Wert wird verwendet "
+            f"(z.B. {'/'.join((example.job, example.instance, *example.extra))} bei "
+            f"{', '.join(sorted(duplicates))}). Unterscheidendes Label per --key-label angeben.",
+            file=sys.stderr,
+        )
     return values
 
 
 def collect_target_status(
-    client: PrometheusClient, errors: list[PrometheusError] | None = None
+    client: PrometheusClient,
+    errors: list[PrometheusError] | None = None,
+    key_labels: tuple[str, ...] = (),
 ) -> list[TargetStatus]:
     """Fehler der Query-API werden nicht geworfen, sondern (falls uebergeben) in errors gesammelt;
     die Targets aus /api/v1/targets werden dann ohne Scrape-Werte zurueckgegeben."""
@@ -247,6 +296,7 @@ def collect_target_status(
             "scrape_series_added",
         ],
         errors,
+        key_labels,
     )
     up = metrics["up"]
     samples_scraped = metrics["scrape_samples_scraped"]
@@ -261,6 +311,7 @@ def collect_target_status(
         return TargetStatus(
             job=key.job,
             instance=key.instance,
+            key_values=key.extra,
             metric_count=int(metric_value) if metric_value is not None else None,
             metric_count_post_relabel=int(post_relabel_value) if post_relabel_value is not None else None,
             scrape_duration=scrape_duration.get(key),
@@ -271,7 +322,11 @@ def collect_target_status(
     statuses = []
     for target in targets:
         labels = target.get("labels", {})
-        key = TargetKey(labels.get("job", "unknown"), labels.get("instance", "unknown"))
+        key = TargetKey(
+            labels.get("job", "unknown"),
+            labels.get("instance", "unknown"),
+            tuple(labels.get(label, "") for label in key_labels),
+        )
         statuses.append(
             build_status(
                 key,
@@ -285,7 +340,7 @@ def collect_target_status(
 
     # Per Remote-Write eingelieferte Scrapes (z.B. Grafana Alloy) tauchen nicht in /api/v1/targets auf,
     # hinterlassen aber up/scrape_*-Serien. Labels und Fehlertext sind fuer diese nicht bekannt.
-    known = {TargetKey(s.job, s.instance) for s in statuses}
+    known = {TargetKey(s.job, s.instance, s.key_values) for s in statuses}
     remote_keys = (up.keys() | samples_scraped.keys()) - known
     for key in sorted(remote_keys):
         up_value = up.get(key)
@@ -336,10 +391,19 @@ def collect_runtime_status(client: PrometheusClient) -> RuntimeStatus:
     )
 
 
-def print_report(statuses: list[TargetStatus], factor: float = DEFAULT_CONSPICUOUS_FACTOR) -> None:
+def failing_targets(statuses: list[TargetStatus]) -> list[TargetStatus]:
+    return [s for s in statuses if s.last_error or s.health == "down"]
+
+
+def print_report(
+    statuses: list[TargetStatus],
+    factor: float = DEFAULT_CONSPICUOUS_FACTOR,
+    key_labels: tuple[str, ...] = (),
+) -> int:
+    """Gibt die Target-Tabelle aus und liefert die Anzahl auffaelliger Targets."""
     if not statuses:
         print("Keine aktiven Targets gefunden.")
-        return
+        return 0
 
     metric_counts = [s.metric_count for s in statuses if s.metric_count is not None]
     label_counts = [s.label_count for s in statuses if s.label_count is not None]
@@ -365,11 +429,11 @@ def print_report(statuses: list[TargetStatus], factor: float = DEFAULT_CONSPICUO
         return str(value) if value is not None else "n/a"
 
     rows = []
-    for s in sorted(statuses, key=lambda s: (s.metric_count or -1), reverse=True):
+    for s in sorted(statuses, key=lambda s: -1 if s.metric_count is None else s.metric_count, reverse=True):
         flags = s.conspicuous_flags(metric_threshold, label_threshold)
         rows.append(
             (
-                f"{s.job}/{s.instance}",
+                s.display_name(key_labels),
                 s.source,
                 s.health,
                 or_na(s.metric_count),
@@ -412,12 +476,14 @@ def print_report(statuses: list[TargetStatus], factor: float = DEFAULT_CONSPICUO
     else:
         print("Keine auffaelligen Targets gefunden.")
 
-    failing = [s for s in statuses if s.last_error or s.health == "down"]
+    failing = failing_targets(statuses)
     if failing:
         print()
         print(f"Targets mit Scrape-Fehler ({len(failing)}):")
         for s in failing:
-            print(f"  {s.job}/{s.instance}: {s.last_error or '(up == 0, kein Fehlertext verfuegbar)'}")
+            print(f"  {s.display_name(key_labels)}: {s.last_error or '(up == 0, kein Fehlertext verfuegbar)'}")
+
+    return len(conspicuous)
 
 
 def print_tsdb_report(client: PrometheusClient, top_n: int = 5) -> None:
@@ -455,13 +521,13 @@ def print_tsdb_report(client: PrometheusClient, top_n: int = 5) -> None:
     print_top(f"Top {top_n} Labels nach Speicherverbrauch", tsdb.top_memory_by_label, as_bytes=True)
 
 
-def print_runtime_report(client: PrometheusClient) -> None:
+def print_runtime_report(client: PrometheusClient) -> RuntimeStatus | None:
     try:
         runtime = collect_runtime_status(client)
     except PrometheusError as exc:
         print()
         print(f"Runtime-Info nicht verfuegbar: {exc}")
-        return
+        return None
 
     def or_na(value):
         return value if value is not None else "n/a"
@@ -476,6 +542,7 @@ def print_runtime_report(client: PrometheusClient) -> None:
     print(f"  Storage-Retention: {or_na(runtime.storage_retention)}")
     print(f"  WAL-/Storage-Korruptionen: {or_na(runtime.corruption_count)}")
     print(f"  Goroutinen: {or_na(runtime.goroutine_count)}")
+    return runtime
 
 
 def str_to_bool(value: str) -> bool:
@@ -493,15 +560,31 @@ def load_config(env_file: str | None) -> PrometheusConfig:
     password = os.getenv("PROMETHEUS_PASSWORD")
     verify_ssl = str_to_bool(os.getenv("PROMETHEUS_VERIFY_SSL", "true"))
     ca_bundle = os.getenv("PROMETHEUS_CA_BUNDLE") or None
-    return PrometheusConfig(url=url, user=user, password=password, verify_ssl=verify_ssl, ca_bundle=ca_bundle)
+    token = os.getenv("PROMETHEUS_TOKEN") or None
+    return PrometheusConfig(
+        url=url, user=user, password=password, verify_ssl=verify_ssl, ca_bundle=ca_bundle, token=token
+    )
 
 
-def build_client(config: PrometheusConfig, insecure: bool = False, ca_file: str | None = None) -> PrometheusClient:
+def build_client(
+    config: PrometheusConfig,
+    insecure: bool = False,
+    ca_file: str | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> PrometheusClient:
     verify_ssl = False if insecure else config.verify_ssl
     ca_bundle = ca_file or config.ca_bundle
     if verify_ssl and ca_bundle and not os.path.isfile(ca_bundle):
         raise PrometheusError(f"CA-Bundle {ca_bundle} existiert nicht.")
-    return PrometheusClient(config.url, config.user, config.password, verify_ssl=verify_ssl, ca_bundle=ca_bundle)
+    return PrometheusClient(
+        config.url,
+        config.user,
+        config.password,
+        verify_ssl=verify_ssl,
+        timeout=timeout,
+        ca_bundle=ca_bundle,
+        token=config.token,
+    )
 
 
 def exit_with_error(exc: PrometheusError) -> None:
@@ -520,15 +603,84 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         "--ca-file",
         help="Pfad zu einem CA-Bundle fuer die Zertifikatspruefung (ueberschreibt PROMETHEUS_CA_BUNDLE)",
     )
+    parser.add_argument(
+        "--timeout",
+        type=positive_float,
+        default=DEFAULT_TIMEOUT,
+        help=f"Timeout je HTTP-Request an Prometheus in Sekunden (Standard: {DEFAULT_TIMEOUT:g})",
+    )
+    parser.add_argument(
+        "--key-label",
+        dest="key_labels",
+        action="append",
+        type=key_label,
+        default=[],
+        metavar="LABEL",
+        help="Zusaetzliches Label, das Targets neben job/instance unterscheidet (z.B. cluster); mehrfach angebbar",
+    )
+
+
+_LABEL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+# job/instance sind bereits Teil des Keys, source/name werden von server.py als Labels belegt
+_RESERVED_KEY_LABELS = {"job", "instance", "source", "name", "section"}
+
+
+def key_label(value: str) -> str:
+    if not _LABEL_NAME_RE.match(value) or value.startswith("__"):
+        raise argparse.ArgumentTypeError(f"ungueltiger Labelname: {value!r}")
+    if value in _RESERVED_KEY_LABELS:
+        raise argparse.ArgumentTypeError(f"Label {value!r} ist reserviert")
+    return value
+
+
+def positive_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"keine Zahl: {value!r}") from exc
+    if number <= 0:
+        raise argparse.ArgumentTypeError(f"muss groesser als 0 sein: {value!r}")
+    return number
 
 
 def create_client_or_exit(args: argparse.Namespace) -> PrometheusClient:
     try:
         config = load_config(args.env_file)
-        return build_client(config, insecure=args.insecure, ca_file=args.ca_file)
+        return build_client(config, insecure=args.insecure, ca_file=args.ca_file, timeout=args.timeout)
     except PrometheusError as exc:
         exit_with_error(exc)
         raise AssertionError("unreachable")
+
+
+FAIL_ON_CONDITIONS = ("down", "conspicuous", "reload")
+EXIT_FAIL_ON = 2
+
+
+def fail_on_conditions(value: str) -> frozenset[str]:
+    conditions = {c.strip() for c in value.split(",") if c.strip()}
+    unknown = conditions - set(FAIL_ON_CONDITIONS)
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unbekannte Bedingung(en): {', '.join(sorted(unknown))} (erlaubt: {', '.join(FAIL_ON_CONDITIONS)})"
+        )
+    return frozenset(conditions)
+
+
+def triggered_conditions(
+    fail_on: frozenset[str],
+    failing_count: int,
+    conspicuous_count: int,
+    runtime: RuntimeStatus | None,
+) -> list[str]:
+    triggered = []
+    if "down" in fail_on and failing_count:
+        triggered.append(f"down ({failing_count} Target(s))")
+    if "conspicuous" in fail_on and conspicuous_count:
+        triggered.append(f"conspicuous ({conspicuous_count} Target(s))")
+    # Ist die Runtime-Info nicht abrufbar, ist der Reload-Status unbekannt und zaehlt nicht als Fehlschlag
+    if "reload" in fail_on and runtime is not None and runtime.reload_config_success is False:
+        triggered.append("reload")
+    return triggered
 
 
 def main() -> None:
@@ -540,16 +692,39 @@ def main() -> None:
         default=DEFAULT_CONSPICUOUS_FACTOR,
         help=f"Target gilt als auffaellig ab diesem Vielfachen des Medians (Standard: {DEFAULT_CONSPICUOUS_FACTOR:g})",
     )
+    parser.add_argument(
+        "--fail-on",
+        type=fail_on_conditions,
+        default=frozenset(),
+        metavar="BEDINGUNGEN",
+        help=(
+            "Kommagetrennt aus " + ",".join(FAIL_ON_CONDITIONS) + f": Exit-Code {EXIT_FAIL_ON}, wenn eine "
+            "Bedingung zutrifft (down = Target down oder mit Scrape-Fehler, conspicuous = auffaellige Targets, "
+            "reload = letzter Config-Reload fehlgeschlagen)"
+        ),
+    )
     args = parser.parse_args()
+    key_labels = tuple(dict.fromkeys(args.key_labels))
 
     client = create_client_or_exit(args)
     try:
-        statuses = collect_target_status(client)
-        print_report(statuses, factor=args.factor)
+        statuses = collect_target_status(client, key_labels=key_labels)
+        conspicuous_count = print_report(statuses, factor=args.factor, key_labels=key_labels)
         print_tsdb_report(client)
-        print_runtime_report(client)
+        runtime = print_runtime_report(client)
     except PrometheusError as exc:
         exit_with_error(exc)
+        return
+
+    triggered = triggered_conditions(
+        args.fail_on,
+        failing_count=len(failing_targets(statuses)),
+        conspicuous_count=conspicuous_count,
+        runtime=runtime,
+    )
+    if triggered:
+        print(f"Fehlschlag wegen --fail-on: {', '.join(triggered)}", file=sys.stderr)
+        sys.exit(EXIT_FAIL_ON)
 
 
 if __name__ == "__main__":

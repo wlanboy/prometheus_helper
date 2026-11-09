@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
@@ -360,11 +360,13 @@ def test_conspicuous_threshold_uses_median(values, factor, expected):
 
 class TestParseTimestamp:
     def test_go_timestamp_with_nanoseconds_and_z(self):
-        assert parse_timestamp("2026-01-02T03:04:05.123456789Z") == datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        assert parse_timestamp("2026-01-02T03:04:05.123456789Z") == datetime(
+            2026, 1, 2, 3, 4, 5, 123456, tzinfo=UTC
+        )
 
     def test_offset(self):
         parsed = parse_timestamp("2026-01-02T03:04:05+02:00")
-        assert parsed == datetime(2026, 1, 2, 1, 4, 5, tzinfo=timezone.utc)
+        assert parsed == datetime(2026, 1, 2, 1, 4, 5, tzinfo=UTC)
 
     @pytest.mark.parametrize("value", [None, "", "2026-01-02", "2026-01-02T03:04:05", "kein datum"])
     def test_invalid(self, value):
@@ -378,10 +380,10 @@ class TestUptime:
 
     def test_uses_server_time(self):
         runtime = self.runtime("2026-01-01T00:00:00Z", "2026-01-01T01:00:30.5Z")
-        assert runtime.uptime_seconds == 3630
+        assert runtime.uptime_seconds == 3630.5
 
     def test_falls_back_to_local_clock(self):
-        start = datetime.now(timezone.utc) - timedelta(minutes=5)
+        start = datetime.now(UTC) - timedelta(minutes=5)
         uptime = self.runtime(start.strftime("%Y-%m-%dT%H:%M:%SZ")).uptime_seconds
         assert uptime is not None
         assert 299 <= uptime <= 310
