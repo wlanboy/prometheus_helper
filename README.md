@@ -1,6 +1,6 @@
 # Prometheus Helper
 
-Kommandozeilen-Tool, das den Status eines Prometheus-Servers abfragt und einen Überblick über dessen aktive Scrape-Targets liefert. Die Verbindung erfolgt per HTTP Basic Auth. Für jedes Target werden folgende Werte ermittelt:
+Kommandozeilen-Tool, das den Status eines Prometheus-Servers abfragt und einen Überblick über dessen aktive Scrape-Targets liefert. Die Anmeldung erfolgt per HTTP Basic Auth oder Bearer-Token. Für jedes Target werden folgende Werte ermittelt:
 
 - Anzahl der gescrapten Metriken (`scrape_samples_scraped`) sowie der davon tatsächlich gespeicherten nach `metric_relabel_configs` (`scrape_samples_post_metric_relabeling`)
 - Anzahl der Target-Labels nach dem Relabeling sowie roh vor dem Relabeling (`discoveredLabels`) – die Differenz zeigt, wie viele Labels durch Relabeling entfernt werden
@@ -43,6 +43,7 @@ Anschließend in der `.env` anpassen:
 | `PROMETHEUS_PASSWORD` | nein | Passwort für Basic Auth |
 | `PROMETHEUS_VERIFY_SSL` | nein | `true`/`false` – SSL-Zertifikatsprüfung aktivieren/deaktivieren (Standard: `true`) |
 | `PROMETHEUS_CA_BUNDLE` | nein | Pfad zu einem CA-Bundle, z. B. `/etc/ssl/certs/ca-certificates.crt` für eine eigene CA |
+| `PROMETHEUS_TOKEN` | nein | Bearer-Token, z. B. für Prometheus hinter OpenShift oder einem OAuth-Proxy. Hat Vorrang vor Basic Auth |
 
 Ist das Zertifikat von einer eigenen CA signiert, `PROMETHEUS_CA_BUNDLE` bzw. `--ca-file` auf das CA-Bundle setzen. `requests` nutzt standardmäßig nur das certifi-Bundle und nicht den System-Store. Nur als Notlösung: `PROMETHEUS_VERIFY_SSL=false` oder `--insecure`.
 
@@ -59,11 +60,34 @@ uv run main.py --env-file /pfad/zu/anderer.env   # abweichende .env-Datei verwen
 uv run main.py --insecure                        # SSL-Zertifikatsprüfung für diesen Lauf deaktivieren
 uv run main.py --factor 3                        # auffällig erst ab dem 3-fachen Median (Standard: 2)
 uv run main.py --ca-file /pfad/zu/ca.pem         # CA-Bundle für die Zertifikatsprüfung
+uv run main.py --timeout 5                       # Timeout je HTTP-Request in Sekunden (Standard: 10)
+uv run main.py --key-label cluster               # Targets zusätzlich nach dem Label cluster unterscheiden
+uv run main.py --fail-on down,conspicuous,reload # Exit-Code 2, wenn eine der Bedingungen zutrifft
 ```
+
+### Gleiche job/instance-Paare
+
+Targets werden über `job` und `instance` zugeordnet. Schicken mehrere Alloy-Agents oder Cluster per Remote-Write Serien mit gleichem `job`/`instance`, die sich nur in einem weiteren Label (z. B. `cluster`) unterscheiden, bliebe pro Paar nur ein Wert übrig. Das Tool warnt dann auf stderr. Mit `--key-label cluster` (mehrfach angebbar) wird das Label Teil des Schlüssels: Die Targets erscheinen getrennt, in der Tabelle als `job/instance cluster=…`, in `server.py` als zusätzliches Label an allen `prometheus_helper_target_*`-Metriken.
+
+### Exit-Codes
+
+| Code | Bedeutung |
+|---|---|
+| 0 | Abfrage erfolgreich, keine `--fail-on`-Bedingung trifft zu |
+| 1 | Fehler: Konfiguration, Verbindung, Authentifizierung oder ungültige Antwort von Prometheus |
+| 2 | Eine der per `--fail-on` gewählten Bedingungen trifft zu |
+
+Bedingungen für `--fail-on` (kommagetrennt):
+
+- `down`: mindestens ein Target ist `down` oder hat einen Scrape-Fehler
+- `conspicuous`: mindestens ein Target ist auffällig (siehe `--factor`)
+- `reload`: der letzte Config-Reload ist fehlgeschlagen. Ist die Runtime-Info nicht abrufbar, löst die Bedingung nicht aus
 
 ## Metrik-Endpunkt (`server.py`)
 
-Neben der einmaligen Kommandozeilen-Ausgabe kann `server.py` dieselben Werte dauerhaft als Prometheus-Metriken unter `/metrics` bereitstellen, sodass ein Prometheus-Server diesen Helper selbst scrapen kann. Die Werte werden bei jedem Scrape live über die Ziel-Prometheus-API neu abgefragt (kein Caching).
+Neben der einmaligen Kommandozeilen-Ausgabe kann `server.py` dieselben Werte dauerhaft als Prometheus-Metriken unter `/metrics` bereitstellen, sodass ein Prometheus-Server diesen Helper selbst scrapen kann. Die Werte werden in einem Hintergrund-Thread alle 30 Sekunden abgefragt (`--refresh-interval`), ein Scrape liefert den letzten Stand. Dadurch antwortet `/metrics` auch dann sofort, wenn der Ziel-Prometheus hängt: Der Abschnitt meldet nach Ablauf von `--timeout` `prometheus_helper_scrape_success 0`, statt dass der Scrape in den `scrape_timeout` läuft. Mehrere scrapende Prometheus-Instanzen vervielfachen die Abfragen nicht. Mit `--refresh-interval 0` wird wie früher bei jedem Scrape live abgefragt. Dann sollte `--timeout` deutlich unter `scrape_timeout` / 4 liegen, weil pro Scrape vier Requests nacheinander laufen.
+
+Fehler bei einzelnen Abfragen, auch unerwartete Antworten wie eine HTML-Loginseite, setzen nur `prometheus_helper_scrape_success` des Abschnitts auf 0. Der Endpunkt selbst antwortet weiter mit 200.
 
 ```bash
 uv run server.py
@@ -75,6 +99,10 @@ Optionale Parameter:
 uv run server.py --env-file /pfad/zu/anderer.env   # abweichende .env-Datei verwenden
 uv run server.py --insecure                        # SSL-Zertifikatsprüfung für diesen Lauf deaktivieren
 uv run server.py --port 9877                        # Port des Metrik-Endpunkts (Standard: 9877)
+uv run server.py --bind 127.0.0.1                   # Adresse des Metrik-Endpunkts (Standard: 0.0.0.0)
+uv run server.py --refresh-interval 30              # Abstand der Hintergrund-Abfrage in s, 0 = live je Scrape (Standard: 30)
+uv run server.py --timeout 5                        # Timeout je HTTP-Request in Sekunden (Standard: 10)
+uv run server.py --key-label cluster                # zusätzliches Label an den Target-Metriken (siehe oben)
 uv run server.py --top-n 5                           # Anzahl der Top-Einträge je TSDB-Rangliste (Standard: 5)
 ```
 
@@ -101,15 +129,24 @@ Bereitgestellte Metriken:
 | `prometheus_helper_runtime_start_time_seconds` | Startzeitpunkt des Prometheus-Prozesses als Unix-Timestamp (Uptime: `time() - prometheus_helper_runtime_start_time_seconds`) |
 | `prometheus_helper_runtime_reload_config_success` | 1 wenn der letzte Config-Reload erfolgreich war, sonst 0 |
 | `prometheus_helper_runtime_goroutines` | Anzahl laufender Goroutinen im Prometheus-Prozess |
-| `prometheus_helper_runtime_corruptions_total` | Anzahl erkannter WAL-/Storage-Korruptionen (`corruptionCount`) |
+| `prometheus_helper_runtime_corruptions` | Anzahl erkannter WAL-/Storage-Korruptionen (`corruptionCount`) |
 | `prometheus_helper_runtime_storage_retention_seconds` | Konfigurierte Storage-Retention in Sekunden (aus `storageRetention`, z. B. `15d`) |
 | `prometheus_helper_scrape_success{section}` | 1 wenn die Abfrage des Abschnitts (`targets`, `tsdb`, `runtime`) vollständig erfolgreich war, sonst 0 – auch bei Teilfehlern wie gestörter Query-API |
 | `prometheus_helper_scrape_duration_seconds{section}` | Dauer der Abfrage je Abschnitt in Sekunden |
+| `prometheus_helper_last_refresh_timestamp_seconds` | Zeitpunkt der letzten Hintergrund-Aktualisierung als Unix-Timestamp (nur mit `--refresh-interval` > 0) |
 
 Beispiel-Alert, der anschlägt, wenn der Helper den Ziel-Prometheus nicht (vollständig) abfragen kann:
 
 ```yaml
 - alert: PrometheusHelperScrapeFailed
   expr: prometheus_helper_scrape_success == 0
+  for: 5m
+```
+
+Beispiel-Alert, falls die Hintergrund-Aktualisierung stehen bleibt:
+
+```yaml
+- alert: PrometheusHelperStale
+  expr: time() - prometheus_helper_last_refresh_timestamp_seconds > 300
   for: 5m
 ```

@@ -6,7 +6,11 @@ import pytest
 from conftest import FakeClient, sample
 
 from main import PrometheusError
-from server import PrometheusHelperCollector, parse_duration_to_seconds
+from server import (
+    CachingCollector,
+    PrometheusHelperCollector,
+    parse_duration_to_seconds,
+)
 
 
 @pytest.mark.parametrize(
@@ -26,10 +30,11 @@ def test_parse_duration_to_seconds(value, expected):
     assert parse_duration_to_seconds(value) == expected
 
 
-def collect(client) -> dict[str, dict[tuple, float]]:
+def collect(client, key_labels=(), collector=None) -> dict[str, dict[tuple, float]]:
     """Liefert {metrikname: {labelwerte: wert}} aus einem Collector-Durchlauf."""
     result: dict[str, dict[tuple, float]] = {}
-    for family in PrometheusHelperCollector(client, top_n=2).collect():
+    collector = collector or PrometheusHelperCollector(client, top_n=2, key_labels=key_labels)
+    for family in collector.collect():
         result[family.name] = {tuple(s.labels.values()): s.value for s in family.samples}
     return result
 
@@ -166,3 +171,90 @@ class TestCollector:
         assert metrics["prometheus_helper_scrape_success"][("tsdb",)] == 1.0
         assert set(metrics["prometheus_helper_target_info"]) == {("node", "h1", "scrape"), ("node", "h2", "scrape")}
         assert metrics["prometheus_helper_target_metric_count"] == {}
+
+    def test_unexpected_exception_marks_section_failed_instead_of_aborting(self, capsys):
+        client = healthy_client()
+        # Ungueltige Struktur: targets ist keine Liste von Objekten
+        client.targets = ["kein-objekt"]
+
+        metrics = collect(client)
+
+        assert metrics["prometheus_helper_scrape_success"] == {("targets",): 0.0, ("tsdb",): 1.0, ("runtime",): 1.0}
+        assert metrics["prometheus_helper_target_info"] == {}
+        assert "Unerwarteter Fehler" in capsys.readouterr().err
+
+    def test_key_labels_become_metric_labels(self):
+        client = FakeClient(
+            targets=[{"labels": {"job": "node", "instance": "h1", "cluster": "c1"}, "health": "up"}],
+            query_result=[
+                {"metric": {"__name__": "up", "job": "node", "instance": "h1", "cluster": "c2"}, "value": [0, "0"]},
+            ],
+        )
+
+        metrics = collect(client, key_labels=("cluster",))
+
+        assert metrics["prometheus_helper_target_info"] == {
+            ("node", "h1", "c1", "scrape"): 1.0,
+            ("node", "h1", "c2", "remote_write"): 1.0,
+        }
+        assert metrics["prometheus_helper_target_up"] == {("node", "h1", "c1"): 1.0, ("node", "h1", "c2"): 0.0}
+
+    def test_describe_does_not_query(self):
+        client = healthy_client()
+        assert PrometheusHelperCollector(client).describe() == []
+        assert client.queries == []
+
+
+class TestCachingCollector:
+    def test_empty_before_first_refresh(self):
+        client = healthy_client()
+        cached = CachingCollector(PrometheusHelperCollector(client), interval=30)
+
+        metrics = collect(None, collector=cached)
+
+        assert metrics == {"prometheus_helper_last_refresh_timestamp_seconds": {}}
+        assert client.queries == []
+
+    def test_serves_snapshot_without_new_queries(self):
+        client = healthy_client()
+        cached = CachingCollector(PrometheusHelperCollector(client), interval=30)
+        cached.refresh()
+
+        first = collect(None, collector=cached)
+        second = collect(None, collector=cached)
+
+        assert len(client.queries) == 1
+        assert first == second
+        assert first["prometheus_helper_scrape_success"][("targets",)] == 1.0
+        assert first["prometheus_helper_last_refresh_timestamp_seconds"][()] > 0
+
+    def test_failed_refresh_keeps_previous_snapshot(self, capsys):
+        cached = CachingCollector(PrometheusHelperCollector(healthy_client()), interval=30)
+        cached.refresh()
+        before = collect(None, collector=cached)
+
+        def broken():
+            raise RuntimeError("kaputt")
+
+        cached.inner.collect = broken
+        cached.refresh()
+
+        assert collect(None, collector=cached) == before
+        assert "kaputt" in capsys.readouterr().err
+
+    def test_background_thread_refreshes_and_stops(self):
+        client = healthy_client()
+        cached = CachingCollector(PrometheusHelperCollector(client), interval=0.01)
+
+        thread = cached.start()
+        try:
+            for _ in range(200):
+                if len(client.queries) >= 2:
+                    break
+                thread.join(0.01)
+        finally:
+            cached.stop()
+            thread.join(1)
+
+        assert len(client.queries) >= 2
+        assert not thread.is_alive()

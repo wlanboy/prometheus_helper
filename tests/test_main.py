@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
@@ -9,6 +10,7 @@ from conftest import FakeClient, sample
 
 import main
 from main import (
+    EXIT_FAIL_ON,
     SOURCE_REMOTE_WRITE,
     SOURCE_SCRAPE,
     PrometheusClient,
@@ -22,12 +24,16 @@ from main import (
     collect_target_status,
     collect_tsdb_status,
     conspicuous_threshold,
+    fail_on_conditions,
     format_bytes,
     format_duration,
+    key_label,
     load_config,
     parse_timestamp,
+    print_report,
     query_metrics_by_target,
     str_to_bool,
+    triggered_conditions,
 )
 
 REAL_LOAD_DOTENV = main.load_dotenv
@@ -95,13 +101,38 @@ class TestPrometheusClient:
         return client
 
     @staticmethod
-    def response(status_code=200, payload=None, text=""):
+    def response(status_code=200, payload=None, text="", json_error=None):
         resp = MagicMock()
         resp.status_code = status_code
         resp.ok = status_code < 400
         resp.text = text
-        resp.json.return_value = payload
+        resp.headers = {"Content-Type": "text/html"}
+        if json_error is not None:
+            resp.json.side_effect = json_error
+        else:
+            resp.json.return_value = payload
         return resp
+
+    def test_get_non_json_response(self):
+        # z.B. SSO-Loginseite hinter einem Reverse-Proxy mit Status 200
+        error = requests.exceptions.JSONDecodeError("Expecting value", "<html>", 0)
+        client = self.make_client(self.response(text="<html>Login</html>", json_error=error))
+        with pytest.raises(PrometheusError, match=r"kein JSON \(Content-Type: text/html\): <html>Login"):
+            client.runtime_info()
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            ["keine", "map"],
+            {"status": "success"},
+            {"status": "success", "data": ["liste"]},
+            {"status": "success", "data": None},
+        ],
+    )
+    def test_get_unexpected_json(self, payload):
+        client = self.make_client(self.response(payload=payload))
+        with pytest.raises(PrometheusError):
+            client.active_targets()
 
     def test_get_returns_data_and_strips_trailing_slash(self):
         client = self.make_client(self.response(payload={"status": "success", "data": {"result": [1]}}))
@@ -149,6 +180,14 @@ class TestPrometheusClient:
     def test_auth_only_with_user_and_password(self, user, password, expected):
         assert PrometheusClient("http://x", user, password).session.auth == expected
 
+    def test_bearer_token_replaces_basic_auth(self):
+        client = PrometheusClient("http://x", "u", "p", token="t0k")
+        assert client.session.auth is None
+        assert client.session.headers["Authorization"] == "Bearer t0k"
+
+    def test_no_authorization_header_without_token(self):
+        assert "Authorization" not in PrometheusClient("http://x", "u", "p").session.headers
+
     @pytest.mark.parametrize(
         "verify_ssl, ca_bundle, expected",
         [
@@ -193,6 +232,39 @@ class TestQueryMetricsByTarget:
             ]
         )
         assert query_metrics_by_target(client, ["up"]) == {"up": {TargetKey("a", "ok"): 1.0}}
+
+    def test_duplicate_keys_warn(self, capsys):
+        client = FakeClient(
+            query_result=[
+                {"metric": {"__name__": "up", "job": "a", "instance": "i1", "cluster": "c1"}, "value": [0, "1"]},
+                {"metric": {"__name__": "up", "job": "a", "instance": "i1", "cluster": "c2"}, "value": [0, "0"]},
+            ]
+        )
+
+        values = query_metrics_by_target(client, ["up"])
+
+        assert len(values["up"]) == 1
+        err = capsys.readouterr().err
+        assert "1 Target(s) mit mehreren Serien je job/instance" in err
+        assert "a/i1" in err and "--key-label" in err
+
+    def test_key_labels_separate_duplicates(self, capsys):
+        client = FakeClient(
+            query_result=[
+                {"metric": {"__name__": "up", "job": "a", "instance": "i1", "cluster": "c1"}, "value": [0, "1"]},
+                {"metric": {"__name__": "up", "job": "a", "instance": "i1", "cluster": "c2"}, "value": [0, "0"]},
+                sample("up", "a", "i2", "1"),
+            ]
+        )
+
+        values = query_metrics_by_target(client, ["up"], key_labels=("cluster",))
+
+        assert values["up"] == {
+            TargetKey("a", "i1", ("c1",)): 1.0,
+            TargetKey("a", "i1", ("c2",)): 0.0,
+            TargetKey("a", "i2", ("",)): 1.0,
+        }
+        assert capsys.readouterr().err == ""
 
     def test_query_error_returns_empty_values_and_records_error(self, capsys):
         error = PrometheusError("kaputt")
@@ -282,6 +354,23 @@ class TestCollectTargetStatus:
         assert remote.discovered_label_count is None
         assert remote.metric_count == 10
         assert remote.last_error == ""
+
+    def test_key_labels_match_scrape_targets_and_remote_write(self):
+        client = FakeClient(
+            targets=[{"labels": {"job": "node", "instance": "h1", "cluster": "c1"}, "health": "up"}],
+            query_result=[
+                {"metric": {"__name__": "up", "job": "node", "instance": "h1", "cluster": "c1"}, "value": [0, "1"]},
+                {"metric": {"__name__": "up", "job": "node", "instance": "h1", "cluster": "c2"}, "value": [0, "0"]},
+            ],
+        )
+
+        statuses = collect_target_status(client, key_labels=("cluster",))
+
+        assert [(s.job, s.instance, s.key_values, s.source, s.health) for s in statuses] == [
+            ("node", "h1", ("c1",), SOURCE_SCRAPE, "up"),
+            ("node", "h1", ("c2",), SOURCE_REMOTE_WRITE, "down"),
+        ]
+        assert statuses[1].display_name(("cluster",)) == "node/h1 cluster=c2"
 
     def test_query_error_keeps_targets_and_collects_error(self):
         errors: list[PrometheusError] = []
@@ -439,6 +528,83 @@ def test_str_to_bool(value, expected):
     assert str_to_bool(value) is expected
 
 
+class TestPrintReport:
+    def test_zero_metrics_sorted_before_unknown(self, capsys):
+        statuses = [
+            make_status(instance="na", metric_count=None),
+            make_status(instance="zero", metric_count=0),
+            make_status(instance="many", metric_count=10),
+        ]
+
+        print_report(statuses)
+
+        out = capsys.readouterr().out
+        assert out.index("job/many") < out.index("job/zero") < out.index("job/na")
+
+    def test_returns_conspicuous_count(self, capsys):
+        statuses = [make_status(instance=str(i), metric_count=10) for i in range(4)]
+        statuses.append(make_status(instance="big", metric_count=1000))
+        assert print_report(statuses) == 1
+        assert print_report([]) == 0
+
+
+class TestFailOn:
+    def test_parse(self):
+        assert fail_on_conditions("down, reload,") == frozenset({"down", "reload"})
+        assert fail_on_conditions("") == frozenset()
+
+    def test_parse_unknown(self):
+        with pytest.raises(argparse.ArgumentTypeError, match="unbekannt"):
+            fail_on_conditions("down,kaputt")
+
+    @staticmethod
+    def runtime(reload_ok):
+        return RuntimeStatus(None, reload_ok, None, None, None, None)
+
+    def test_triggered(self):
+        all_conditions = frozenset({"down", "conspicuous", "reload"})
+        assert triggered_conditions(all_conditions, 2, 1, self.runtime(False)) == [
+            "down (2 Target(s))",
+            "conspicuous (1 Target(s))",
+            "reload",
+        ]
+        assert triggered_conditions(all_conditions, 0, 0, self.runtime(True)) == []
+        # Unbekannter Reload-Status loest nicht aus
+        assert triggered_conditions(all_conditions, 0, 0, None) == []
+        assert triggered_conditions(all_conditions, 0, 0, self.runtime(None)) == []
+
+    def test_only_selected_conditions(self):
+        assert triggered_conditions(frozenset({"reload"}), 5, 5, self.runtime(True)) == []
+
+    def test_main_exit_code(self, monkeypatch, capsys):
+        client = FakeClient(targets=[{"labels": {"job": "j", "instance": "i"}, "health": "down"}])
+        monkeypatch.setattr(main, "create_client_or_exit", lambda args: client)
+        monkeypatch.setattr("sys.argv", ["main.py", "--fail-on", "down"])
+
+        with pytest.raises(SystemExit) as excinfo:
+            main.main()
+
+        assert excinfo.value.code == EXIT_FAIL_ON
+        assert "down (1 Target(s))" in capsys.readouterr().err
+
+    def test_main_without_fail_on_exits_normally(self, monkeypatch, capsys):
+        client = FakeClient(targets=[{"labels": {"job": "j", "instance": "i"}, "health": "down"}])
+        monkeypatch.setattr(main, "create_client_or_exit", lambda args: client)
+        monkeypatch.setattr("sys.argv", ["main.py"])
+        main.main()
+
+
+class TestKeyLabel:
+    @pytest.mark.parametrize("value", ["cluster", "_x", "region2"])
+    def test_valid(self, value):
+        assert key_label(value) == value
+
+    @pytest.mark.parametrize("value", ["job", "instance", "source", "name", "__name__", "1abc", "a-b", ""])
+    def test_invalid(self, value):
+        with pytest.raises(argparse.ArgumentTypeError):
+            key_label(value)
+
+
 class TestLoadConfig:
     ENV_VARS = (
         "PROMETHEUS_URL",
@@ -446,6 +612,7 @@ class TestLoadConfig:
         "PROMETHEUS_PASSWORD",
         "PROMETHEUS_VERIFY_SSL",
         "PROMETHEUS_CA_BUNDLE",
+        "PROMETHEUS_TOKEN",
     )
 
     @pytest.fixture(autouse=True)
@@ -473,8 +640,9 @@ class TestLoadConfig:
         monkeypatch.setenv("PROMETHEUS_PASSWORD", "p")
         monkeypatch.setenv("PROMETHEUS_VERIFY_SSL", "false")
         monkeypatch.setenv("PROMETHEUS_CA_BUNDLE", "/ca.pem")
+        monkeypatch.setenv("PROMETHEUS_TOKEN", "t")
         assert load_config(None) == PrometheusConfig(
-            url="http://prom", user="u", password="p", verify_ssl=False, ca_bundle="/ca.pem"
+            url="http://prom", user="u", password="p", verify_ssl=False, ca_bundle="/ca.pem", token="t"
         )
 
     def test_empty_ca_bundle_is_none(self, monkeypatch):
@@ -513,6 +681,11 @@ class TestBuildClient:
         ca_file.write_text("dummy")
         client = build_client(self.config(ca_bundle="/does/not/exist"), ca_file=str(ca_file))
         assert client.session.verify == str(ca_file)
+
+    def test_passes_timeout_and_token(self):
+        client = build_client(self.config(token="t0k"), timeout=2.5)
+        assert client.timeout == 2.5
+        assert client.session.headers["Authorization"] == "Bearer t0k"
 
     def test_verify_ssl_false_from_config(self):
         client = build_client(self.config(verify_ssl=False, ca_bundle="/does/not/exist"))
