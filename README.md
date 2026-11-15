@@ -62,6 +62,7 @@ uv run main.py --factor 3                        # auffällig erst ab dem 3-fach
 uv run main.py --ca-file /pfad/zu/ca.pem         # CA-Bundle für die Zertifikatsprüfung
 uv run main.py --timeout 5                       # Timeout je HTTP-Request in Sekunden (Standard: 10)
 uv run main.py --key-label cluster               # Targets zusätzlich nach dem Label cluster unterscheiden
+uv run main.py --top-n 20                        # Anzahl der Top-Einträge je TSDB-Rangliste (Standard: 5)
 uv run main.py --fail-on down,conspicuous,reload # Exit-Code 2, wenn eine der Bedingungen zutrifft
 ```
 
@@ -86,6 +87,10 @@ Bedingungen für `--fail-on` (kommagetrennt):
 ## Metrik-Endpunkt (`server.py`)
 
 Neben der einmaligen Kommandozeilen-Ausgabe kann `server.py` dieselben Werte dauerhaft als Prometheus-Metriken unter `/metrics` bereitstellen, sodass ein Prometheus-Server diesen Helper selbst scrapen kann. Die Werte werden in einem Hintergrund-Thread alle 30 Sekunden abgefragt (`--refresh-interval`), ein Scrape liefert den letzten Stand. Dadurch antwortet `/metrics` auch dann sofort, wenn der Ziel-Prometheus hängt: Der Abschnitt meldet nach Ablauf von `--timeout` `prometheus_helper_scrape_success 0`, statt dass der Scrape in den `scrape_timeout` läuft. Mehrere scrapende Prometheus-Instanzen vervielfachen die Abfragen nicht. Mit `--refresh-interval 0` wird wie früher bei jedem Scrape live abgefragt. Dann sollte `--timeout` deutlich unter `scrape_timeout` / 4 liegen, weil pro Scrape vier Requests nacheinander laufen.
+
+Im Live-Modus arbeitet `server.py` gleichzeitige Scrapes nacheinander ab, weil sich alle Anfragen eine HTTP-Session zum Ziel-Prometheus teilen. Scrapen mehrere Prometheus-Instanzen, wartet jeder Scrape auf die vorherigen und kann dabei in den `scrape_timeout` laufen. Für mehrere Scraper ist deshalb der Cache-Modus gedacht.
+
+Der Endpunkt hat keine Authentifizierung und lauscht standardmäßig auf `0.0.0.0`. Wer den Port erreicht, löst damit Abfragen gegen den Ziel-Prometheus aus, die mit den hinterlegten Zugangsdaten laufen. Im Live-Modus kostet jeder Aufruf vier Requests, darunter `/api/v1/status/tsdb`, das bei großen Heads teuer ist. Der Port sollte deshalb nur für den scrapenden Prometheus erreichbar sein, etwa über eine NetworkPolicy oder mit `--bind 127.0.0.1` hinter einem Sidecar.
 
 Fehler bei einzelnen Abfragen, auch unerwartete Antworten wie eine HTML-Loginseite, setzen nur `prometheus_helper_scrape_success` des Abschnitts auf 0. Der Endpunkt selbst antwortet weiter mit 200.
 

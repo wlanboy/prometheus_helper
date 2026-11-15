@@ -386,6 +386,41 @@ class TestCollectTargetStatus:
         assert len(errors) == 1
         assert [(s.job, s.health, s.metric_count) for s in statuses] == [("node", "up", None)]
 
+    def test_duplicate_scrape_targets_warn(self, capsys):
+        client = FakeClient(
+            targets=[
+                {"labels": {"job": "pods", "instance": "pod-a", "port": "8080"}},
+                {"labels": {"job": "pods", "instance": "pod-a", "port": "9090"}},
+                {"labels": {"job": "pods", "instance": "pod-b"}},
+            ],
+            query_result=[sample("up", "pods", "pod-a", "1")],
+        )
+
+        statuses = collect_target_status(client)
+
+        # Die CLI zeigt beide Targets, die Werte sind aber nicht eindeutig zuzuordnen
+        assert [(s.instance, s.source) for s in statuses] == [
+            ("pod-a", SOURCE_SCRAPE),
+            ("pod-a", SOURCE_SCRAPE),
+            ("pod-b", SOURCE_SCRAPE),
+        ]
+        err = capsys.readouterr().err
+        assert "1 Target(s) aus /api/v1/targets mit gleichem job/instance" in err
+        assert "pods/pod-a" in err and "--key-label" in err
+
+    def test_key_labels_separate_duplicate_scrape_targets(self, capsys):
+        client = FakeClient(
+            targets=[
+                {"labels": {"job": "pods", "instance": "pod-a", "port": "8080"}},
+                {"labels": {"job": "pods", "instance": "pod-a", "port": "9090"}},
+            ],
+        )
+
+        statuses = collect_target_status(client, key_labels=("port",))
+
+        assert [s.key_values for s in statuses] == [("8080",), ("9090",)]
+        assert capsys.readouterr().err == ""
+
     def test_targets_error_is_raised(self):
         with pytest.raises(PrometheusError):
             collect_target_status(FakeClient(targets=PrometheusError("down")))
@@ -620,6 +655,18 @@ class TestFailOn:
         assert "down (1 Target(s))" in err
         assert "Auswertung unvollstaendig" in err
 
+    def test_main_passes_top_n_to_tsdb_report(self, monkeypatch, capsys):
+        client = FakeClient(tsdb={"seriesCountByMetricName": [{"name": f"m{i}", "value": 10 - i} for i in range(8)]})
+        monkeypatch.setattr(main, "create_client_or_exit", lambda args: client)
+        monkeypatch.setattr("sys.argv", ["main.py", "--top-n", "7"])
+
+        main.main()
+
+        assert client.tsdb_limits == [7]
+        out = capsys.readouterr().out
+        assert "Top 7 Metriken nach Serienanzahl" in out
+        assert "m6" in out and "m7" not in out
+
     def test_main_without_fail_on_exits_normally(self, monkeypatch, capsys):
         client = FakeClient(targets=[{"labels": {"job": "j", "instance": "i"}, "health": "down"}])
         monkeypatch.setattr(main, "create_client_or_exit", lambda args: client)
@@ -666,6 +713,16 @@ class TestPositiveNumbers:
             main.main()
 
         assert "--factor" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("value", ["0", "-1"])
+    def test_main_rejects_invalid_top_n(self, monkeypatch, capsys, value):
+        monkeypatch.setattr(main, "create_client_or_exit", lambda args: pytest.fail("Client darf nicht erzeugt werden"))
+        monkeypatch.setattr("sys.argv", ["main.py", f"--top-n={value}"])
+
+        with pytest.raises(SystemExit):
+            main.main()
+
+        assert "--top-n" in capsys.readouterr().err
 
     @pytest.mark.parametrize("value", ["0", "-1"])
     def test_server_rejects_invalid_top_n(self, monkeypatch, capsys, value):

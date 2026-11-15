@@ -12,6 +12,7 @@ from prometheus_client import start_http_server
 from prometheus_client.core import REGISTRY, GaugeMetricFamily
 
 from main import (
+    DEFAULT_TOP_N,
     PrometheusClient,
     PrometheusError,
     RuntimeStatus,
@@ -22,7 +23,6 @@ from main import (
     collect_tsdb_status,
     create_client_or_exit,
     parse_timestamp,
-    positive_int,
 )
 
 T = TypeVar("T")
@@ -47,7 +47,7 @@ def parse_duration_to_seconds(value: str) -> float | None:
 
 
 class PrometheusHelperCollector:
-    def __init__(self, client: PrometheusClient, top_n: int = 5, key_labels: tuple[str, ...] = ()):
+    def __init__(self, client: PrometheusClient, top_n: int = DEFAULT_TOP_N, key_labels: tuple[str, ...] = ()):
         self.client = client
         self.top_n = top_n
         self.key_labels = key_labels
@@ -166,8 +166,14 @@ class PrometheusHelperCollector:
             scrape_duration,
         )
 
+        seen: set[tuple[str, ...]] = set()
         for s in statuses:
             key = [s.job, s.instance, *s.key_values]
+            # Gleiche Label-Sets doppelt auszugeben, verwirft Prometheus beim Scrape als Duplikat.
+            # Die Warnung dazu kommt aus collect_target_status.
+            if tuple(key) in seen:
+                continue
+            seen.add(tuple(key))
             target_info.add_metric([*key, s.source], 1.0)
             if s.health != "n/a":
                 target_up.add_metric(key, 1.0 if s.health == "up" else 0.0)
@@ -384,9 +390,6 @@ def main() -> None:
             "Abstand der Hintergrund-Aktualisierung in Sekunden; 0 fragt bei jedem Scrape live ab "
             "(Standard: 30)"
         ),
-    )
-    parser.add_argument(
-        "--top-n", type=positive_int, default=5, help="Anzahl der Top-Eintraege je TSDB-Rangliste (Standard: 5)"
     )
     args = parser.parse_args()
 

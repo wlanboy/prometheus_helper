@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from datetime import UTC, datetime
 
 import pytest
@@ -199,10 +201,54 @@ class TestCollector:
         }
         assert metrics["prometheus_helper_target_up"] == {("node", "h1", "c1"): 1.0, ("node", "h1", "c2"): 0.0}
 
+    def test_duplicate_scrape_targets_are_exported_once(self, capsys):
+        client = FakeClient(
+            targets=[
+                {"labels": {"job": "pods", "instance": "pod-a", "port": "8080"}, "health": "up"},
+                {"labels": {"job": "pods", "instance": "pod-a", "port": "9090"}, "health": "down"},
+            ],
+        )
+        collector = PrometheusHelperCollector(client)
+
+        families = {f.name: f.samples for f in collector.collect()}
+
+        assert len(families["prometheus_helper_target_info"]) == 1
+        assert len(families["prometheus_helper_target_up"]) == 1
+        assert len(families["prometheus_helper_target_label_count"]) == 1
+        assert "--key-label" in capsys.readouterr().err
+
     def test_describe_does_not_query(self):
         client = healthy_client()
         assert PrometheusHelperCollector(client).describe() == []
         assert client.queries == []
+
+    def test_concurrent_collects_are_serialized(self):
+        client = healthy_client()
+        active = 0
+        max_active = 0
+        counter_lock = threading.Lock()
+        original = client.active_targets
+
+        def slow_active_targets():
+            nonlocal active, max_active
+            with counter_lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.05)
+            with counter_lock:
+                active -= 1
+            return original()
+
+        client.active_targets = slow_active_targets
+        collector = PrometheusHelperCollector(client)
+        threads = [threading.Thread(target=lambda: list(collector.collect())) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+
+        assert max_active == 1
+        assert len(client.queries) == 4
 
 
 class TestCachingCollector:

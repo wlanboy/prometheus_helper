@@ -159,6 +159,7 @@ class PrometheusError(Exception):
 
 
 DEFAULT_TIMEOUT = 10.0
+DEFAULT_TOP_N = 5
 
 
 class PrometheusClient:
@@ -320,6 +321,8 @@ def collect_target_status(
         )
 
     statuses = []
+    seen: set[TargetKey] = set()
+    duplicates: set[TargetKey] = set()
     for target in targets:
         labels = target.get("labels", {})
         key = TargetKey(
@@ -327,6 +330,9 @@ def collect_target_status(
             labels.get("instance", "unknown"),
             tuple(labels.get(label, "") for label in key_labels),
         )
+        if key in seen:
+            duplicates.add(key)
+        seen.add(key)
         statuses.append(
             build_status(
                 key,
@@ -338,10 +344,21 @@ def collect_target_status(
             )
         )
 
+    if duplicates:
+        # Z.B. Relabeling setzt instance auf den Pod-Namen und der Pod hat mehrere Ports
+        key_desc = "/".join(("job", "instance", *key_labels))
+        example = min(duplicates)
+        print(
+            f"Warnung: {len(duplicates)} Target(s) aus /api/v1/targets mit gleichem {key_desc}, "
+            f"die Scrape-Werte sind nicht eindeutig zuzuordnen "
+            f"(z.B. {'/'.join((example.job, example.instance, *example.extra))}). "
+            f"Unterscheidendes Label per --key-label angeben.",
+            file=sys.stderr,
+        )
+
     # Per Remote-Write eingelieferte Scrapes (z.B. Grafana Alloy) tauchen nicht in /api/v1/targets auf,
     # hinterlassen aber up/scrape_*-Serien. Labels und Fehlertext sind fuer diese nicht bekannt.
-    known = {TargetKey(s.job, s.instance, s.key_values) for s in statuses}
-    remote_keys = (up.keys() | samples_scraped.keys()) - known
+    remote_keys = (up.keys() | samples_scraped.keys()) - seen
     for key in sorted(remote_keys):
         up_value = up.get(key)
         statuses.append(
@@ -357,7 +374,7 @@ def collect_target_status(
     return statuses
 
 
-def collect_tsdb_status(client: PrometheusClient, top_n: int = 5) -> TsdbStatus:
+def collect_tsdb_status(client: PrometheusClient, top_n: int = DEFAULT_TOP_N) -> TsdbStatus:
     data = client.tsdb_status(limit=top_n)
     head_stats = data.get("headStats", {})
 
@@ -486,7 +503,7 @@ def print_report(
     return len(conspicuous)
 
 
-def print_tsdb_report(client: PrometheusClient, top_n: int = 5) -> None:
+def print_tsdb_report(client: PrometheusClient, top_n: int = DEFAULT_TOP_N) -> None:
     try:
         tsdb = collect_tsdb_status(client, top_n=top_n)
     except PrometheusError as exc:
@@ -618,6 +635,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         metavar="LABEL",
         help="Zusaetzliches Label, das Targets neben job/instance unterscheidet (z.B. cluster); mehrfach angebbar",
     )
+    parser.add_argument(
+        "--top-n",
+        type=positive_int,
+        default=DEFAULT_TOP_N,
+        help=f"Anzahl der Top-Eintraege je TSDB-Rangliste (Standard: {DEFAULT_TOP_N})",
+    )
 
 
 _LABEL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
@@ -721,7 +744,7 @@ def main() -> None:
     try:
         statuses = collect_target_status(client, query_errors, key_labels=key_labels)
         conspicuous_count = print_report(statuses, factor=args.factor, key_labels=key_labels)
-        print_tsdb_report(client)
+        print_tsdb_report(client, top_n=args.top_n)
         runtime = print_runtime_report(client)
     except PrometheusError as exc:
         exit_with_error(exc)
