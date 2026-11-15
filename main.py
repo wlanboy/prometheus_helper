@@ -643,6 +643,16 @@ def positive_float(value: str) -> float:
     return number
 
 
+def positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"keine ganze Zahl: {value!r}") from exc
+    if number <= 0:
+        raise argparse.ArgumentTypeError(f"muss groesser als 0 sein: {value!r}")
+    return number
+
+
 def create_client_or_exit(args: argparse.Namespace) -> PrometheusClient:
     try:
         config = load_config(args.env_file)
@@ -688,7 +698,7 @@ def main() -> None:
     add_common_args(parser)
     parser.add_argument(
         "--factor",
-        type=float,
+        type=positive_float,
         default=DEFAULT_CONSPICUOUS_FACTOR,
         help=f"Target gilt als auffaellig ab diesem Vielfachen des Medians (Standard: {DEFAULT_CONSPICUOUS_FACTOR:g})",
     )
@@ -707,8 +717,9 @@ def main() -> None:
     key_labels = tuple(dict.fromkeys(args.key_labels))
 
     client = create_client_or_exit(args)
+    query_errors: list[PrometheusError] = []
     try:
-        statuses = collect_target_status(client, key_labels=key_labels)
+        statuses = collect_target_status(client, query_errors, key_labels=key_labels)
         conspicuous_count = print_report(statuses, factor=args.factor, key_labels=key_labels)
         print_tsdb_report(client)
         runtime = print_runtime_report(client)
@@ -724,6 +735,11 @@ def main() -> None:
     )
     if triggered:
         print(f"Fehlschlag wegen --fail-on: {', '.join(triggered)}", file=sys.stderr)
+    # Ohne Query-Ergebnis fehlen Remote-Write-Targets und Metrikzahlen; ein gruener Lauf waere irrefuehrend
+    if query_errors:
+        print("Fehler: Metrikabfrage fehlgeschlagen, Auswertung unvollstaendig.", file=sys.stderr)
+        sys.exit(1)
+    if triggered:
         sys.exit(EXIT_FAIL_ON)
 
 

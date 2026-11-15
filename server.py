@@ -22,6 +22,7 @@ from main import (
     collect_tsdb_status,
     create_client_or_exit,
     parse_timestamp,
+    positive_int,
 )
 
 T = TypeVar("T")
@@ -50,6 +51,9 @@ class PrometheusHelperCollector:
         self.client = client
         self.top_n = top_n
         self.key_labels = key_labels
+        # start_http_server bedient Scrapes in mehreren Threads, die sich die requests.Session des Clients
+        # teilen. Der Lock serialisiert die Abrufe im Live-Modus (--refresh-interval 0)
+        self._lock = threading.Lock()
 
     def describe(self):
         # Verhindert, dass REGISTRY.register() fuer die Namenspruefung einen kompletten Abruf ausloest
@@ -83,7 +87,14 @@ class PrometheusHelperCollector:
         success.add_metric([section], 0.0 if errors else 1.0)
         return result
 
-    def collect(self):
+    def collect(self) -> Iterable:
+        # Erst vollstaendig unter dem Lock abfragen, dann ausliefern, damit der Lock nicht ueber yield
+        # gehalten wird
+        with self._lock:
+            families = list(self._collect())
+        yield from families
+
+    def _collect(self) -> Iterable:
         scrape_success = GaugeMetricFamily(
             "prometheus_helper_scrape_success",
             "1 wenn die Abfrage des Abschnitts (targets, tsdb, runtime) vollstaendig erfolgreich war, sonst 0",
@@ -375,7 +386,7 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--top-n", type=int, default=5, help="Anzahl der Top-Eintraege je TSDB-Rangliste (Standard: 5)"
+        "--top-n", type=positive_int, default=5, help="Anzahl der Top-Eintraege je TSDB-Rangliste (Standard: 5)"
     )
     args = parser.parse_args()
 

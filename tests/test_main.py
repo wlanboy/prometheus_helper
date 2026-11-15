@@ -30,6 +30,8 @@ from main import (
     key_label,
     load_config,
     parse_timestamp,
+    positive_float,
+    positive_int,
     print_report,
     query_metrics_by_target,
     str_to_bool,
@@ -587,6 +589,37 @@ class TestFailOn:
         assert excinfo.value.code == EXIT_FAIL_ON
         assert "down (1 Target(s))" in capsys.readouterr().err
 
+    @pytest.mark.parametrize("argv", [["main.py"], ["main.py", "--fail-on", "down,conspicuous"]])
+    def test_main_query_error_exits_with_error(self, monkeypatch, capsys, argv):
+        client = FakeClient(
+            targets=[{"labels": {"job": "j", "instance": "i"}, "health": "up"}],
+            query_result=PrometheusError("query failed"),
+        )
+        monkeypatch.setattr(main, "create_client_or_exit", lambda args: client)
+        monkeypatch.setattr("sys.argv", argv)
+
+        with pytest.raises(SystemExit) as excinfo:
+            main.main()
+
+        assert excinfo.value.code == 1
+        assert "Auswertung unvollstaendig" in capsys.readouterr().err
+
+    def test_main_query_error_wins_over_fail_on(self, monkeypatch, capsys):
+        client = FakeClient(
+            targets=[{"labels": {"job": "j", "instance": "i"}, "health": "down"}],
+            query_result=PrometheusError("query failed"),
+        )
+        monkeypatch.setattr(main, "create_client_or_exit", lambda args: client)
+        monkeypatch.setattr("sys.argv", ["main.py", "--fail-on", "down"])
+
+        with pytest.raises(SystemExit) as excinfo:
+            main.main()
+
+        assert excinfo.value.code == 1
+        err = capsys.readouterr().err
+        assert "down (1 Target(s))" in err
+        assert "Auswertung unvollstaendig" in err
+
     def test_main_without_fail_on_exits_normally(self, monkeypatch, capsys):
         client = FakeClient(targets=[{"labels": {"job": "j", "instance": "i"}, "health": "down"}])
         monkeypatch.setattr(main, "create_client_or_exit", lambda args: client)
@@ -603,6 +636,48 @@ class TestKeyLabel:
     def test_invalid(self, value):
         with pytest.raises(argparse.ArgumentTypeError):
             key_label(value)
+
+
+class TestPositiveNumbers:
+    @pytest.mark.parametrize(("value", "expected"), [("1", 1.0), ("2.5", 2.5), ("0.01", 0.01)])
+    def test_positive_float_valid(self, value, expected):
+        assert positive_float(value) == expected
+
+    @pytest.mark.parametrize("value", ["0", "-1", "-0.5", "abc", ""])
+    def test_positive_float_invalid(self, value):
+        with pytest.raises(argparse.ArgumentTypeError):
+            positive_float(value)
+
+    @pytest.mark.parametrize(("value", "expected"), [("1", 1), ("5", 5), ("100", 100)])
+    def test_positive_int_valid(self, value, expected):
+        assert positive_int(value) == expected
+
+    @pytest.mark.parametrize("value", ["0", "-3", "2.5", "abc", ""])
+    def test_positive_int_invalid(self, value):
+        with pytest.raises(argparse.ArgumentTypeError):
+            positive_int(value)
+
+    @pytest.mark.parametrize("value", ["0", "-2"])
+    def test_main_rejects_invalid_factor(self, monkeypatch, capsys, value):
+        monkeypatch.setattr(main, "create_client_or_exit", lambda args: pytest.fail("Client darf nicht erzeugt werden"))
+        monkeypatch.setattr("sys.argv", ["main.py", f"--factor={value}"])
+
+        with pytest.raises(SystemExit):
+            main.main()
+
+        assert "--factor" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("value", ["0", "-1"])
+    def test_server_rejects_invalid_top_n(self, monkeypatch, capsys, value):
+        import server
+
+        monkeypatch.setattr(server, "create_client_or_exit", lambda args: pytest.fail("Client darf nicht erzeugt werden"))
+        monkeypatch.setattr("sys.argv", ["server.py", f"--top-n={value}"])
+
+        with pytest.raises(SystemExit):
+            server.main()
+
+        assert "--top-n" in capsys.readouterr().err
 
 
 class TestLoadConfig:

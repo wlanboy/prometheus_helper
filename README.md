@@ -74,7 +74,7 @@ Targets werden über `job` und `instance` zugeordnet. Schicken mehrere Alloy-Age
 | Code | Bedeutung |
 |---|---|
 | 0 | Abfrage erfolgreich, keine `--fail-on`-Bedingung trifft zu |
-| 1 | Fehler: Konfiguration, Verbindung, Authentifizierung oder ungültige Antwort von Prometheus |
+| 1 | Fehler: Konfiguration, Verbindung, Authentifizierung oder ungültige Antwort von Prometheus. Gilt auch, wenn nur die Metrikabfrage scheitert und der Report deshalb unvollständig ist. Code 1 hat dann Vorrang vor Code 2 |
 | 2 | Eine der per `--fail-on` gewählten Bedingungen trifft zu |
 
 Bedingungen für `--fail-on` (kommagetrennt):
